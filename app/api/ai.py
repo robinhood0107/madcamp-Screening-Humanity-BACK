@@ -45,6 +45,7 @@ class StoryGenerationRequest(BaseModel):
     situation: str = Field(..., description="사용자가 입력한 짧은 상황")
     opponent_name: str = Field(None, description="상대방 캐릭터 이름")
     character_persona: str = Field(None, description="캐릭터 페르소나 설정")
+    model: Optional[str] = Field(None, description="사용할 LLM 모델 (gemini-2.5-flash 또는 gemma-3-27b)")
 
 class StoryGenerationResponse(BaseModel):
     """스토리 생성 응답 모델"""
@@ -87,38 +88,52 @@ async def generate_story(
         import json as _json
         from app.core.config import settings
         
-        # 시나리오 생성은 무조건 Gemini-2.0-flash 사용
-        model_to_use = "gemini-2.0-flash"
+        # 사용자가 모델을 지정한 경우 해당 모델 사용, 아니면 Gemini 시도 후 로컬 LLM 폴백
+        user_selected_model = request.model
         
-        api_key = getattr(settings, "GEMINI_API_KEY", None)
-        if not api_key:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Gemini API Key가 설정되지 않았습니다. .env 파일의 GOOGLE_API_KEY를 확인해주세요."
-            )
-
         result = None
-        try:
-            # 1차 시도: Gemini 2.0 Flash
+        
+        if user_selected_model:
+            # 사용자가 명시적으로 모델을 선택한 경우, 해당 모델만 사용
+            import logging
+            logging.info(f"Using user-selected model: {user_selected_model}")
             result = await call_llm(
                 messages, 
-                model="gemini-2.0-flash", 
+                model=user_selected_model, 
                 temperature=0.8, 
                 max_tokens=4000,
                 json_mode=False
             )
-        except Exception as gemini_error:
-            # 2차 시도: Local Ollama (Gemma 3 27B)
-            import logging
-            logging.warning(f"Gemini API failed, switching to Local Ollama (gemma-3-27b): {gemini_error}")
+        else:
+            # 모델 미지정: Gemini 시도 → 실패 시 로컬 LLM 폴백
+            api_key = getattr(settings, "GEMINI_API_KEY", None)
+            if not api_key:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Gemini API Key가 설정되지 않았습니다. .env 파일의 GOOGLE_API_KEY를 확인해주세요."
+                )
             
-            result = await call_llm(
-                messages,
-                model="gemma-3-27b",
-                temperature=0.8,
-                max_tokens=4000,
-                json_mode=False
-            )
+            try:
+                # 1차 시도: Gemini 2.5 Flash
+                result = await call_llm(
+                    messages, 
+                    model="gemini-2.5-flash", 
+                    temperature=0.8, 
+                    max_tokens=4000,
+                    json_mode=False
+                )
+            except Exception as gemini_error:
+                # 2차 시도: Local Ollama (Gemma 3 27B)
+                import logging
+                logging.warning(f"Gemini API failed, switching to Local Ollama (gemma-3-27b): {gemini_error}")
+                
+                result = await call_llm(
+                    messages,
+                    model="gemma-3-27b",
+                    temperature=0.8,
+                    max_tokens=4000,
+                    json_mode=False
+                )
         
         content = result if isinstance(result, str) else result.get("content", "")
         
@@ -262,7 +277,7 @@ async def generate_character_details(
         if not api_key:
             raise ValueError("Gemini API Key missing")
 
-        model_to_use = "gemini-2.0-flash"
+        model_to_use = "gemini-2.5-flash"
         result = await call_llm(
             messages, 
             model=model_to_use, 

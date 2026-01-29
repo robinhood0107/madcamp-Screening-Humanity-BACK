@@ -235,12 +235,19 @@ async def _synthesize_tts_internal(
             tts_body = request.model_dump_for_gpt_sovits()
             # logger.info(f"TTS 요청: text={tts_body.get('text')[:30]}...")
             
-            tts_response = await client.post(
-                f"{tts_base_url}/tts",
-                json=tts_body
-            )
-            tts_response.raise_for_status()
-            audio_content = tts_response.content
+            # Debug: Request Body 확인
+            print(f"[TTS DEBUG] Payload: {json.dumps(tts_body, ensure_ascii=False)}")
+            
+            try:
+                tts_response = await client.post(
+                    f"{tts_base_url}/tts",
+                    json=tts_body
+                )
+                tts_response.raise_for_status()
+                audio_content = tts_response.content
+            except httpx.HTTPStatusError as e:
+                print(f"[TTS ERROR] Status: {e.response.status_code}, Body: {e.response.text}")
+                raise HTTPException(status_code=e.response.status_code, detail=f"TTS Server Error: {e.response.text}")
             
         if not audio_content:
             raise HTTPException(status_code=500, detail="TTS 생성 결과가 비어있습니다.")
@@ -355,12 +362,19 @@ async def synthesize(request: TTSRequest, db: AsyncSession = Depends(get_db)):
         async with httpx.AsyncClient(timeout=settings.TTS_TIMEOUT) as client:
             # TTS 요청 (POST /tts)
             tts_body = request.model_dump_for_gpt_sovits()
-            tts_response = await client.post(
-                f"{tts_base_url}/tts",
-                json=tts_body
-            )
-            tts_response.raise_for_status()
-            audio_content = tts_response.content
+            # Debug: Request Body 확인
+            print(f"[TTS DEBUG] Payload: {json.dumps(tts_body, ensure_ascii=False)}")
+
+            try:
+                tts_response = await client.post(
+                    f"{tts_base_url}/tts",
+                    json=tts_body
+                )
+                tts_response.raise_for_status()
+                audio_content = tts_response.content
+            except httpx.HTTPStatusError as e:
+                print(f"[TTS ERROR] Status: {e.response.status_code}, Body: {e.response.text}")
+                raise HTTPException(status_code=e.response.status_code, detail=f"TTS Server Error: {e.response.text}")
         
         # 스트리밍 응답 (바이너리 직접 반환)
         if request.return_binary:

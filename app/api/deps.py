@@ -37,6 +37,20 @@ async def get_current_user(
     
     # 쿠키 또는 헤더에서 토큰 가져오기
     token = await get_token_from_request(request)
+
+    # 1. 토큰이 있으면 검증 시도
+    if token:
+        try:
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+            user_id: str = payload.get("sub")
+            if user_id:
+                result = await db.execute(select(User).where(User.id == user_id))
+                user = result.scalar_one_or_none()
+                if user:
+                    return user
+        except JWTError:
+            # 토큰이 만료되었거나 유효하지 않으면 폴백으로 이동
+            pass
     
     # [복구] 개발 환경 폴백: 토큰이 없거나 유효하지 않으면 dev-user 반환
     dev_user_id = "dev-user"

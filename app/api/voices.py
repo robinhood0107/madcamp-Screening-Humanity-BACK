@@ -10,6 +10,7 @@ from sqlalchemy import select
 import uuid
 import logging
 import httpx
+from pathlib import Path
 
 from app.api.deps import get_db, get_current_user, require_admin
 from app.models.voice import Voice
@@ -149,6 +150,84 @@ async def get_server_files(
 _ALLOWED_AUDIO_EXT = {".wav", ".mp3", ".flac", ".ogg"}
 
 
+async def process_ref_audio(path: str, train_input_dir: Optional[str] = None) -> str:
+    """
+    Server A에 오디오 파일 검증 요청.
+    - 3~10초: 통과 (원본 경로 반환)
+    - 10초 초과: 자동 트리밍 시도 (prepare-ref-audio 호출) -> 성공 시 변경된 경로 반환
+    - 3초 미만: 에러 발생
+    """
+    api_url = settings.SERVER_A_FILES_API_URL.rstrip("/")
+    
+    # 1. 검증 요청
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(f"{api_url}/api/files/validate-ref-audio", data={"path": path})
+            if resp.status_code != 200:
+                 raise HTTPException(status_code=400, detail=f"Audio validation API failed: {resp.text}")
+            
+            data = resp.json()
+            is_valid = data.get("valid")
+            duration = data.get("duration_sec", 0.0)
+            
+            if is_valid:
+                return path
+
+            # 2. 유효하지 않은 경우 처리
+            # 3초 미만
+            if duration < 3.0:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"참조 오디오가 너무 짧습니다 ({duration}s). 최소 3초 이상이어야 합니다."
+                )
+            
+            # 10초 초과 -> 자동 트리밍
+            if duration > 10.0:
+                if not train_input_dir:
+                    # train_input_dir 없을 경우 경로에서 추론 시도
+                    try:
+                        p = Path(path)
+                        if "sample_train_voice" in path:
+                             train_input_dir = p.parent.name
+                        else:
+                             raise ValueError("Cannot infer train_input_dir")
+                    except:
+                        raise HTTPException(status_code=400, detail="오디오가 10초를 초과하여 자르기가 필요하지만 train_input_dir 정보가 부족합니다.")
+                
+                # 자르기 요청
+                ref_file_name = Path(path).name
+                prepare_resp = await client.post(
+                    f"{api_url}/api/files/prepare-ref-audio",
+                    data={
+                        "sub_path": train_input_dir,
+                        "ref_file": ref_file_name,
+                        "max_duration_sec": 10.0
+                    },
+                    timeout=30.0
+                )
+                
+                if prepare_resp.status_code == 200:
+                    prep_data = prepare_resp.json()
+                    if prep_data.get("success"):
+                        # 성공: 새 파일명으로 경로 구성
+                        new_filename = prep_data.get("ref_audio_file")
+                        parent_dir = str(Path(path).parent)
+                        return f"{parent_dir}/{new_filename}".replace("\\", "/")
+                    else:
+                        raise HTTPException(status_code=400, detail=f"Auto-trimming failed: {prep_data.get('message')}")
+                else:
+                    raise HTTPException(status_code=400, detail="Auto-trimming API request failed.")
+
+            # 그 외
+            raise HTTPException(status_code=400, detail=f"Audio validation failed: {data.get('message')}")
+            
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Server A connection failed: {str(e)}"
+        )
+
+
 @router.post("/voices/server-files/upload")
 async def upload_train_voice_file(
     file: UploadFile = File(...),
@@ -231,6 +310,44 @@ async def create_server_folder(
                 raise HTTPException(
                     status_code=response.status_code,
                     detail=f"Mkdir Failed: {response.text}"
+                )
+            
+            return response.json()
+            
+            return response.json()
+            
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Server A 연결 실패: {str(e)}"
+        )
+
+
+@router.post("/voices/server-files/trim")
+async def trim_server_audio(
+    path: str = Form(..., description="원본 파일 경로 (Server A 기준)"),
+    max_duration_sec: float = Form(9.0, description="목표 길이 (초)"),
+    current_user: User = Depends(require_admin)
+):
+    """Server A 오디오 자르기 (관리자 전용)"""
+    api_url = settings.SERVER_A_FILES_API_URL.rstrip("/")
+    trim_url = f"{api_url}/api/files/trim-audio"
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                trim_url, 
+                data={
+                    "source_path": path,
+                    "max_duration_sec": max_duration_sec,
+                    "output_suffix": "_trimmed"
+                }
+            )
+            
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Trim Failed: {response.text}"
                 )
             
             return response.json()
@@ -372,6 +489,12 @@ async def create_voice(
             Voice.__table__.update().where(Voice.is_default == True).values(is_default=False)
         )
     
+    # ref_audio 검증 및 자동 처리 (Server A 호출)
+    # create 시에는 request에 train_input_dir가 있을 수도 없을 수도 있음.
+    # 하지만 file-manager.tsx에서는 계산해서 보냄.
+    final_ref_path = await process_ref_audio(request.ref_audio_path, request.train_input_dir)
+    request.ref_audio_path = final_ref_path
+    
     # 새 음성 생성
     voice = Voice(
         id=str(uuid.uuid4()),
@@ -444,6 +567,14 @@ async def update_voice(
                 Voice.id != voice_id
             ).values(is_default=False)
         )
+    
+    # ref_audio_path 변경 시 검증
+    # ref_audio_path 변경 시 검증 및 자동 처리
+    if request.ref_audio_path and request.ref_audio_path != voice.ref_audio_path:
+        # train_input_dir 확보
+        target_dir = request.train_input_dir or getattr(voice, "train_input_dir", None)
+        final_ref_path = await process_ref_audio(request.ref_audio_path, target_dir)
+        request.ref_audio_path = final_ref_path
     
     # 업데이트할 필드만 적용
     update_data = request.model_dump(exclude_unset=True)
@@ -699,7 +830,7 @@ async def get_training_log_proxy(
             
             if response.status_code == 404:
                 raise HTTPException(status_code=404, detail="Log not found")
-                
+            
             if response.status_code != 200:
                 raise HTTPException(
                     status_code=response.status_code,
@@ -713,6 +844,3 @@ async def get_training_log_proxy(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Server A 학습 API 연결 실패: {str(e)}"
         )
-
-# ============ 기존 에러 핸들링 끝부분 ============
-

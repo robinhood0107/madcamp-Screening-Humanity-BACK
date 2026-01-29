@@ -288,7 +288,39 @@ async def register_voice(
 ):
     """학습 완료 후 Voice 등록. ref_audio_path = SERVER_A_TRAIN_VOICE_ROOT/train_input_dir/ref_audio_file. gpt/sovits 미지정 시 GET /api/files/logs에서 model_name 매칭으로 자동 추론."""
     root = getattr(settings, "SERVER_A_TRAIN_VOICE_ROOT", "/opt/GPT-SoVITS/sample_train_voice")
-    ref_audio_path = f"{root.rstrip('/')}/{body.train_input_dir.lstrip('/')}/{body.ref_audio_file}"
+    
+    # ref_audio를 8초로 잘라서 ref_audio.wav 생성 (Server A에 요청)
+    files_api_url = settings.SERVER_A_FILES_API_URL.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            prepare_resp = await client.post(
+                f"{files_api_url}/api/files/prepare-ref-audio",
+                data={
+                    "train_input_dir": body.train_input_dir,
+                    "max_duration_sec": 10.0  # 10초로 제한
+                }
+            )
+            if prepare_resp.status_code == 200:
+                prepare_data = prepare_resp.json()
+                if prepare_data.get("success"):
+                    # 잘린 ref_audio.wav 사용
+                    ref_audio_file = prepare_data.get("ref_audio_file", body.ref_audio_file)
+                    import logging
+                    logging.info(f"ref_audio prepared: {prepare_data}")
+                else:
+                    ref_audio_file = body.ref_audio_file
+            else:
+                # 실패 시 원본 사용
+                ref_audio_file = body.ref_audio_file
+                import logging
+                logging.warning(f"prepare-ref-audio failed: {prepare_resp.text}")
+    except Exception as e:
+        # 실패해도 계속 진행 (원본 사용)
+        ref_audio_file = body.ref_audio_file
+        import logging
+        logging.warning(f"prepare-ref-audio error: {e}")
+    
+    ref_audio_path = f"{root.rstrip('/')}/{body.train_input_dir.lstrip('/')}/{ref_audio_file}"
 
     gpt_path = body.gpt_weights_path
     sovits_path = body.sovits_weights_path

@@ -72,8 +72,13 @@ def load_preset_characters() -> List[Dict[str, Any]]:
                     obj = json.load(fp)
                 if not isinstance(obj, dict):
                     continue
-                if "id" not in obj:
-                    obj["id"] = f.stem
+                
+                # [FIX] JSON 내부 ID가 파일명과 다르면 DB 연결이 깨짐.
+                # 강제로 파일명(stem)을 ID로 사용.
+                obj["id"] = f.stem
+                
+                # 파일명(확장자 포함)을 메타데이터로 저장 (ID 불일치 대비 - 이제는 ID=Filename이므로 덜 중요하지만 유지)
+                obj["_filename"] = f.name
                 out.append(obj)
             except Exception as e:
                 print(f"사전설정 JSON 로드 실패 {f}: {e}")
@@ -400,9 +405,17 @@ async def update_admin_character_voice(
             base = _resolve_preset_characters_dir()
             if not base or not base.is_dir():
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="프리셋 디렉터리를 찾을 수 없습니다")
-            path = base / f"{character_id}.json"
+            
+            # ID와 파일명이 다를 수 있으므로 _filename 메타데이터 활용
+            filename = preset_char.get("_filename")
+            if not filename:
+                # Fallback: ID를 파일명으로 가정 (구버전 호환)
+                filename = f"{character_id}.json"
+            
+            path = base / filename
             if not path.exists():
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="사전설정 캐릭터를 찾을 수 없습니다")
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"사전설정 캐릭터 파일을 찾을 수 없습니다: {filename}")
+
             with open(path, "r", encoding="utf-8") as f:
                 obj = json.load(f)
             obj["voice_id"] = body.voice_id if body.voice_id is not None else None

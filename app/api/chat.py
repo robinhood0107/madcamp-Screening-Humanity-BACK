@@ -5,19 +5,16 @@ from typing import List, Optional, Dict, Any
 import httpx
 import uuid
 import logging
-import re
 import json
 from app.core.config import settings
-from app.api.deps import get_db, get_current_user_optional
-from app.api.tts import _synthesize_tts_internal, TTSRequest
+from app.api.deps import get_db, get_current_user_optional, get_current_principal_optional, AuthPrincipal
 from app.models.user import User
 from app.models.character import Character
 from app.core.llm import call_llm, call_llm_stream
 from app.services.context_manager import context_manager
+from app.services import chat_service, character_service
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from app.models.chat_message import ChatMessage
-from app.api.characters import load_preset_characters
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -196,85 +193,249 @@ class ChatRequest(BaseModel):
     tts_streaming_mode: int = 0
     tts_speed: float = 1.0  # 발화 속도 (1.0=정속, 0.5~2.0)
 
-@router.post("/chat")
-async def chat(
+
+def _resolve_speaker_name_for_response(
+    *,
+    speaker_name: Optional[str],
+    resolved_character_name: Optional[str],
+    opponent: str,
+    is_director_mode: bool,
+    current_speaker: Optional[str],
+) -> str:
+    """
+    [역할]
+    `/chat` 응답 후처리/저장/TTS에 사용할 최종 화자명을 일관된 규칙으로 결정한다.
+
+    [왜 여기서 처리하나]
+    - `/chat` 본문에서 감독모드/일반모드 분기 후 `speaker_name` 재조합 규칙이 흩어지면,
+      저장명/응답명/TTS 화자명이 미세하게 달라지는 회귀가 생기기 쉽다.
+
+    [주의]
+    - 감독 모드에서는 `current_speaker`가 최우선이다. (프론트가 기대하는 현재 발화자 표시와 맞춰야 함)
+    """
+    final_name = speaker_name or resolved_character_name or opponent
+    if is_director_mode and current_speaker:
+        final_name = current_speaker
+    return final_name
+
+
+async def _run_chat_turn_llm_and_persist(
+    *,
+    db: AsyncSession,
+    session_id: str,
     request: ChatRequest,
-    db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    chat_messages: List[Dict[str, str]],
+    system_instruction: Optional[str],
+    speaker_name: str,
+) -> tuple[str, Dict[str, Any]]:
+    """
+    [역할]
+    `/chat`의 LLM 호출 -> 응답 후처리 -> DB 저장/commit 흐름을 한 번에 수행한다.
+
+    [왜 여기서 처리하나]
+    - 라우터에서 LLM 호출/정제/저장을 모두 직접 처리하면 예외 매핑과 응답 조립 로직이 섞여 읽기 어렵다.
+    - 이 helper는 "한 턴 처리" 단위를 고정해 `chat()`가 transport + 응답 조립에 집중하게 만든다.
+
+    [부작용]
+    - 외부 LLM 호출
+    - DB insert/commit (사용자 메시지/assistant 메시지 저장)
+
+    [실패/예외]
+    - `call_llm`/DB 저장 예외는 상위 라우터로 올린다. (라우터가 mock fallback/HTTPException 정책 담당)
+
+    [주의]
+    - `sanitize_assistant_reply_content`를 통하지 않으면 speaker prefix/형식 후처리 규칙이 깨질 수 있다.
+    """
+    result = await call_llm(
+        messages=chat_messages,
+        model=request.model,
+        temperature=request.temperature,
+        max_tokens=request.max_tokens,
+        system_instruction=system_instruction,
+    )
+    content = chat_service.sanitize_assistant_reply_content(result["content"], speaker_name)
+    await chat_service.persist_chat_turn_messages(
+        db=db,
+        session_id=session_id,
+        raw_request_messages=request.messages,
+        assistant_content=content,
+        speaker_name=speaker_name,
+    )
+    return content, result["usage"]
+
+
+async def _maybe_attach_tts_audio_url(
+    *,
+    response_data: Dict[str, Any],
+    content: str,
+    request: ChatRequest,
+    current_user: Optional[User],
+    db: AsyncSession,
+) -> None:
+    """
+    [역할]
+    `/chat` 응답에 TTS `audio_url`을 조건부로 추가한다.
+
+    [왜 여기서 처리하나]
+    - TTS는 `/chat` 성공 응답의 "부가 기능"이므로, 본문 LLM/DB 저장 성공 흐름과 실패 격리가 필요하다.
+    - 별도 helper로 분리하면 `audio_url` 누락 시에도 기본 채팅 응답 계약을 안정적으로 유지할 수 있다.
+
+    [부작용]
+    - 캐릭터 voice_id 조회(DB/preset 가능)
+    - 내부 TTS 라우터 helper 호출(파일/외부 HTTP/DB 캐시 경유 가능)
+
+    [실패/예외]
+    - 여기서는 broad except로 흡수하고 경고 로그만 남긴다.
+      `/chat`의 핵심 계약은 텍스트 응답 성공이며, TTS 실패가 전체 요청 실패로 전파되면 UX 회귀가 크다.
+
+    [주의]
+    - `response_data["audio_url"]` 추가는 성공 시에만 수행한다. 키를 억지로 넣으면 프론트 분기 로직이 흔들릴 수 있다.
+    """
+    if not request.tts_enabled or not (content or "").strip():
+        return
+
+    voice_id = await character_service.resolve_character_voice_id_for_tts(
+        character_id=request.character_id,
+        db=db,
+        current_user_id=current_user.id if current_user else None,
+        default_voice_id="default",
+    )
+    try:
+        audio_url = await chat_service.synthesize_chat_tts_audio_url(
+            text=content,
+            voice_id=voice_id,
+            streaming_mode=request.tts_streaming_mode,
+            speed_factor=request.tts_speed or 1.0,
+            current_user=current_user,
+            db=db,
+        )
+        if audio_url:
+            response_data["audio_url"] = audio_url
+    except Exception as e:
+        logger.warning("TTS 합성 실패(audio_url 미포함): %s", e)
+
+
+async def _generate_chat_stream_sse_events(
+    *,
+    chat_messages: List[Dict[str, str]],
+    request: ChatRequest,
+    system_instruction: Optional[str],
+    session_id: str,
 ):
     """
-    배우 모드: AI가 한 캐릭터로서 한 턴만 응답
-    감독 모드: 두 캐릭터가 교대로 응답
-    """
-    session_id = request.session_id or str(uuid.uuid4())
-    summary = await context_manager.get_summary(session_id, db)
-    
-    # 시나리오 정보 추출
-    scenario = request.scenario or {}
-    opponent = scenario.get("opponent", "상대방")
-    situation = scenario.get("situation", "대화 중")
-    user_name = scenario.get("user_name", "감독")
-    background = scenario.get("background")
-    
-    # 턴 카운트 계산
-    turn_count = len(request.messages) // 2
-    
-    # 감독 모드 감지: persona에 "배우 1", "배우 2" 포함 여부로 판단
-    is_director_mode = request.persona and "[배우 1:" in request.persona and "[배우 2:" in request.persona
+    [역할]
+    `/chat/stream`의 SSE 이벤트 프레임을 생성한다.
 
-    # request_messages 조기 구성 → manage_context (슬라이딩·요약·save) → summary cap 450
-    request_messages = [{"role": "assistant" if m.role == "ai" else m.role, "content": m.content} for m in request.messages]
+    [왜 여기서 처리하나]
+    - SSE frame 포맷(`content`/`done`/`full_content`/`session_id`)은 `/chat/stream`의 핵심 외부 계약이라
+      라우터 본문에서 흩어지지 않게 generator helper로 고정한다.
+
+    [실패/예외]
+    - 스트리밍 중 예외는 에러 프레임으로 변환해 연결을 정상 종료한다.
+      (HTTP 예외로 바꾸면 이미 열린 SSE 연결에서 프론트가 처리하기 어려움)
+
+    [주의]
+    - `done=True` 최종 프레임 shape는 프론트 소비 코드가 강하게 의존하므로 키명/타입 변경 금지.
+    """
+    full_content = ""
+    try:
+        async for chunk in call_llm_stream(
+            messages=chat_messages,
+            model=request.model,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            system_instruction=system_instruction,
+        ):
+            full_content += chunk
+            yield f"data: {json.dumps({'content': chunk, 'done': False})}\n\n"
+
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "content": "",
+                    "done": True,
+                    "full_content": full_content,
+                    "session_id": session_id,
+                }
+            )
+            + "\n\n"
+        )
+        logger.info("스트리밍 완료: session=%s, length=%s", session_id, len(full_content))
+    except Exception as e:
+        logger.error("스트리밍 오류: %s", e)
+        yield f"data: {json.dumps({'error': str(e), 'done': True})}\n\n"
+
+
+async def _prepare_chat_request_for_llm(
+    *,
+    request: ChatRequest,
+    db: AsyncSession,
+    session_id: str,
+) -> Dict[str, Any]:
+    """
+    [역할]
+    `/chat` 요청을 LLM 호출 직전 상태로 정규화/구성한다.
+
+    [왜 여기서 처리하나]
+    - `/chat` 본문에서 가장 복잡한 단계(시나리오 해석, 컨텍스트 관리, 감독/일반 모드 분기, 시스템 프롬프트 구성)를
+      한 곳으로 모아 라우터를 얇게 유지한다.
+    - 반환 dict 키는 이후 `/chat` 오케스트레이션에서 필요한 최소 상태를 명시적으로 고정한다.
+
+    [부작용]
+    - `context_manager` 호출(요약 조회/갱신, DB/Redis 접근 가능)
+    - 캐릭터 정체성 조회(DB/preset 가능)
+
+    [실패/예외]
+    - 감독 모드 파싱 실패는 내부에서 로그 후 일반 모드로 폴백한다. (요청 전체 실패보다 호환성 우선)
+    - 그 외 예외는 상위 라우터로 전파해 `/chat`의 최종 예외 정책으로 처리한다.
+
+    [주의]
+    - 반환 키(`opponent`, `did_summarize`, `system_instruction`, `chat_messages` 등)는
+      `chat()` 후속 단계가 직접 참조하므로 이름 변경 금지.
+    """
+    summary = await context_manager.get_summary(session_id, db)
+
+    scenario_fields = chat_service.extract_scenario_fields(
+        request.scenario,
+        default_user_name="감독",
+    )
+    opponent = scenario_fields["opponent"] or "상대방"
+    situation = scenario_fields["situation"] or "대화 중"
+    user_name = scenario_fields["user_name"] or "감독"
+    background = scenario_fields["background"]
+
+    turn_count = len(request.messages) // 2
+    is_director_mode = bool(request.persona and "[배우 1:" in request.persona and "[배우 2:" in request.persona)
+
+    request_messages = chat_service.normalize_request_messages_for_context(request.messages)
     request_messages, summary, did_summarize = await context_manager.manage_context(
-        request_messages, summary, session_id, db, request.persona,
+        request_messages,
+        summary,
+        session_id,
+        db,
+        request.persona,
         getattr(settings, "CONTEXT_WINDOW_TURNS", 6),
         getattr(settings, "CONTEXT_MAX_TOKENS", 8192),
         getattr(settings, "CONTEXT_TOKEN_THRESHOLD_RATIO", 0.8),
     )
-    summary = truncate_to_sentence(summary or "", 250)  # 4k 컨텍스트: 요약은 250자 이내로 문장 종결
+    summary = truncate_to_sentence(summary or "", 250)
 
-    # 주연 모드에서 AI 캐릭터 이름 확정용 (Preset→DB→fallback). 감독 모드에서는 None.
     resolved_character_name: Optional[str] = None
-    
-    messages = []
-    
+    current_speaker: Optional[str] = None
+    speaker_name: Optional[str] = None
+    messages: List[Dict[str, str]] = []
+
     if is_director_mode:
-        # 감독 모드: 두 캐릭터 정보 파싱
         try:
-            # persona 파싱: "[배우 1: 이름]\n내용\n\n[배우 2: 이름]\n내용"
-            parts = request.persona.split("\n\n")
-            char1_section = parts[0] if len(parts) > 0 else ""
-            char2_section = parts[1] if len(parts) > 1 else ""
-            
-            # 캐릭터 이름 추출
-            char1_name = char1_section.split("[배우 1: ")[1].split("]")[0] if "[배우 1: " in char1_section else "배우1"
-            char2_name = char2_section.split("[배우 2: ")[1].split("]")[0] if "[배우 2: " in char2_section else "배우2"
-            
-            # 페르소나 추출
-            char1_persona = "\n".join(char1_section.split("\n")[1:]) if "\n" in char1_section else char1_section
-            char2_persona = "\n".join(char2_section.split("\n")[1:]) if "\n" in char2_section else char2_section
-            
-            # 현재 말할 캐릭터 결정 (교대로)
-            # AI 메시지 개수를 세어 순서 결정
-            ai_msg_count = len([m for m in request.messages if m.role in ["assistant", "ai"]])
-            
-            if request.current_speaker:
-                current_speaker = request.current_speaker
-            else:
-                # 짝수 번째(0, 2, 4...)는 배우 1, 홀수 번째(1, 3, 5...)는 배우 2
-                if ai_msg_count % 2 == 0:
-                    current_speaker = char1_name
-                else:
-                    current_speaker = char2_name
-            
-            # 현재 화자의 정보 선택
-            if current_speaker == char1_name:
-                speaker_persona = char1_persona
-                partner_name = char2_name
-            else:
-                speaker_persona = char2_persona
-                partner_name = char1_name
-            
-            # 시스템 프롬프트 생성 (감독 모드: 제4의 벽·제3의 벽 엄수 문구 포함)
+            director_ctx = chat_service.parse_director_turn_context(
+                persona=request.persona or "",
+                messages=request.messages,
+                current_speaker_override=request.current_speaker,
+            )
+            current_speaker = director_ctx["current_speaker"]
+            speaker_persona = director_ctx["speaker_persona"]
+            partner_name = director_ctx["partner_name"]
             system_prompt = format_persona_for_actor(
                 character_name=current_speaker,
                 persona=speaker_persona,
@@ -284,33 +445,25 @@ async def chat(
                 director_note=request.director_note,
                 summary=summary,
                 background=background,
-                is_director_mode=True
+                is_director_mode=True,
             )
-            
             messages.append({"role": "system", "content": system_prompt})
-            
         except Exception as e:
-            logger.error(f"감독 모드 파싱 실패: {e}")
-            # 폴백: 기본 모드로 처리
+            logger.error("감독 모드 파싱 실패: %s", e)
             is_director_mode = False
-    
-    if not is_director_mode:
-        # 주연 모드: 단일 캐릭터
-        # AI 캐릭터 이름을 Preset → DB → scenario.opponent 순으로 확정 (scenario.opponent에 의존하지 않음)
-        resolved_character_name = scenario.get("opponent", "캐릭터")
-        if request.character_id:
-            presets = load_preset_characters()
-            p = next((x for x in presets if x.get("id") == request.character_id), None)
-            if p:
-                resolved_character_name = p.get("name", resolved_character_name)
-            else:
-                r = await db.execute(select(Character).where(Character.id == request.character_id))
-                c = r.scalar_one_or_none()
-                if c:
-                    resolved_character_name = c.name
-                    request.persona = c.persona or request.persona
 
-        # 주연 모드: messages가 비어 있지 않을 때만 format_persona_for_actor 사용 (첫 대사는 format_for_first_dialogue로 별도 처리)
+    if not is_director_mode:
+        resolved_character_name = opponent or "캐릭터"
+        if request.character_id:
+            resolved_character_name, persona_override = await chat_service.resolve_character_identity(
+                character_id=request.character_id,
+                fallback_name=resolved_character_name,
+                db=db,
+                preset_loader=character_service.load_preset_characters_from_disk,
+            )
+            if persona_override:
+                request.persona = persona_override
+
         if request.persona and request.messages:
             system_prompt = format_persona_for_actor(
                 character_name=resolved_character_name,
@@ -320,129 +473,111 @@ async def chat(
                 turn_count=turn_count,
                 director_note=request.director_note,
                 summary=summary,
-                background=background
+                background=background,
             )
             messages.append({"role": "system", "content": system_prompt})
         speaker_name = resolved_character_name
-    
-    # 대화 기록 추가 (request_messages는 manage_context 결과 사용)
-    # 감독 모드일 때만 초기화 (주연은 이미 위 블록에서 speaker_name=character_name 설정됨)
+
     if is_director_mode:
         speaker_name = None
 
-    # 주연 모드 + messages 비어 있음: 첫 대사 전용 format_for_first_dialogue (resolved_character_name은 주연 블록에서 이미 확정)
     if not request_messages and not is_director_mode:
-        opponent_fd = scenario.get("opponent", "상대방")
-        situation_fd = scenario.get("situation", "대화 중")
-        background_fd = scenario.get("background")
-        system_fd, user_fd = format_for_first_dialogue(resolved_character_name or "캐릭터", request.persona or "", opponent_fd, situation_fd, background_fd)
+        system_fd, user_fd = format_for_first_dialogue(
+            resolved_character_name or "캐릭터",
+            request.persona or "",
+            opponent,
+            situation,
+            background,
+        )
         messages.append({"role": "system", "content": system_fd})
         messages.append({"role": "user", "content": user_fd})
         speaker_name = resolved_character_name or "캐릭터"
     else:
-        if not request_messages:
-            request_messages.append({"role": "user", "content": "대화를 시작해주세요."})
-        for msg in request_messages:
-            role = "assistant" if msg["role"] == "ai" else msg["role"]
-            messages.append({"role": role, "content": msg["content"]})
-    
-    # 시스템 프롬프트 분리
-    system_instruction = None
-    chat_messages = []
-    
-    for msg in messages:
-        if msg["role"] == "system":
-            if system_instruction:
-                system_instruction += "\n\n" + msg["content"]
-            else:
-                system_instruction = msg["content"]
-        else:
-            chat_messages.append(msg)
+        chat_service.append_history_messages(
+            messages_acc=messages,
+            request_messages=request_messages,
+            default_user_message="대화를 시작해주세요.",
+        )
+
+    system_instruction, chat_messages = chat_service.split_system_and_chat_messages(messages)
+    return {
+        "opponent": opponent,
+        "did_summarize": did_summarize,
+        "resolved_character_name": resolved_character_name,
+        "is_director_mode": is_director_mode,
+        "current_speaker": current_speaker,
+        "speaker_name": speaker_name,
+        "system_instruction": system_instruction,
+        "chat_messages": chat_messages,
+    }
+
+@router.post("/chat")
+async def chat(
+    request: ChatRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+    principal: Optional[AuthPrincipal] = Depends(get_current_principal_optional),
+):
+    """
+    배우 모드: AI가 한 캐릭터로서 한 턴만 응답
+    감독 모드: 두 캐릭터가 교대로 응답
+
+    [왜 여기서 이렇게 나누나]
+    - 준비 단계(`_prepare_chat_request_for_llm`)와 실행 단계(`_run_chat_turn_llm_and_persist`)를 분리해,
+      라우터는 예외 매핑/응답 shape/TTS 부가 기능 처리 중심으로 유지한다.
+
+    [주의]
+    - broad except의 mock fallback 응답은 현재 프론트/개발 흐름 호환을 위한 계약 일부다.
+      제거/축소는 2차 정책에서 명시적으로 결정해야 한다.
+    """
+    session_id = request.session_id or str(uuid.uuid4())
+    if principal and principal.kind == "guest" and principal.guest_session:
+        logger.info("Guest chat request session_id=%s guest_session_id=%s", session_id, principal.guest_session.id)
+    prepared = await _prepare_chat_request_for_llm(
+        request=request,
+        db=db,
+        session_id=session_id,
+    )
+    opponent = prepared["opponent"]
+    did_summarize = prepared["did_summarize"]
+    resolved_character_name = prepared["resolved_character_name"]
+    is_director_mode = prepared["is_director_mode"]
+    current_speaker = prepared["current_speaker"]
+    speaker_name = prepared["speaker_name"]
+    system_instruction = prepared["system_instruction"]
+    chat_messages = prepared["chat_messages"]
 
     try:
-        if speaker_name is None:
-            speaker_name = resolved_character_name or opponent
-        if is_director_mode and "current_speaker" in locals():
-            speaker_name = current_speaker
-        
-        # LLM 호출
-        result = await call_llm(
-            messages=chat_messages,
-            model=request.model,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            system_instruction=system_instruction
+        speaker_name = _resolve_speaker_name_for_response(
+            speaker_name=speaker_name,
+            resolved_character_name=resolved_character_name,
+            opponent=opponent,
+            is_director_mode=is_director_mode,
+            current_speaker=current_speaker,
         )
-        
-        # 후처리: 이모티콘 및 이름 접두사 제거
-        content = result["content"]
-        content = re.sub(r'[\U00010000-\U0010ffff]', '', content) # 이모티콘 제거
-        
-        # 이름 접두사 제거 (예: "엘사: ")
-        if speaker_name:
-            safe_name = re.escape(speaker_name)
-            content = re.sub(f"^{safe_name}\s*[:：]\s*", "", content)
-
-        # 1. 사용자 메시지 저장 (마지막 메시지가 유저일 경우)
-        # request.messages의 마지막 항목을 저장 (중복 방지를 위해 session_id와 timestamp 등을 고려해야 하나, 
-        # 여기서는 단순 로깅. 엄밀한 채팅 시스템은 메시지 ID를 프론트에서 관리함)
-        if request.messages and request.messages[-1].role in ["user", "human"]:
-            last_msg = request.messages[-1]
-            user_msg_db = ChatMessage(
-                session_id=session_id,
-                role="user",
-                content=last_msg.content,
-                # character_name? User는 user_name이 있는데 request.scenario.user_name에 있음
-            )
-            db.add(user_msg_db)
-            
-        # 2. AI 응답 저장
-        ai_msg_db = ChatMessage(
+        content, usage = await _run_chat_turn_llm_and_persist(
+            db=db,
             session_id=session_id,
-            role="assistant",
-            content=content,
-            character_name=speaker_name # AI 화자 이름
+            request=request,
+            chat_messages=chat_messages,
+            system_instruction=system_instruction,
+            speaker_name=speaker_name,
         )
-        db.add(ai_msg_db)
-        
-        await db.commit()
 
         response_data = {
             "content": content,
-            "usage": result["usage"],
+            "usage": usage,
             "session_id": session_id,
             "context_summarized": did_summarize
         }
 
-        # TTS: tts_enabled이고 content가 있으면 character_id→voice_id로 합성, audio_url 반영
-        if request.tts_enabled and (content or "").strip():
-            voice_id = "default"
-            if request.character_id:
-                res = await db.execute(select(Character).where(Character.id == request.character_id))
-                c = res.scalar_one_or_none()
-                if c and (c.is_preset or (current_user and c.user_id == current_user.id)):
-                    voice_id = c.voice_id or "default"
-                elif c is None:
-                    # Preset 전용(DB 없음): load_preset_characters에서 voice_id 조회
-                    presets = load_preset_characters()
-                    p = next((x for x in presets if x.get("id") == request.character_id), None)
-                    if p:
-                        voice_id = p.get("voice_id") or "default"
-            try:
-                tts_req = TTSRequest(
-                    text=content.strip(),
-                    voice_id=voice_id,
-                    streaming_mode=request.tts_streaming_mode,
-                    return_binary=False,
-                    text_lang="ko",
-                    prompt_lang="ko",
-                    speed_factor=request.tts_speed or 1.0,
-                )
-                tts_resp = await _synthesize_tts_internal(tts_req, current_user, db)
-                if tts_resp.get("success") and tts_resp.get("data", {}).get("audio_url"):
-                    response_data["audio_url"] = tts_resp["data"]["audio_url"]
-            except Exception as e:
-                logger.warning("TTS 합성 실패(audio_url 미포함): %s", e)
+        await _maybe_attach_tts_audio_url(
+            response_data=response_data,
+            content=content,
+            request=request,
+            current_user=current_user,
+            db=db,
+        )
 
         return {
             "success": True,
@@ -471,20 +606,33 @@ async def chat_stream(
     request: ChatRequest,
     db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional),
+    principal: Optional[AuthPrincipal] = Depends(get_current_principal_optional),
 ):
     """
     SSE 스트리밍 채팅 엔드포인트.
     Gemini 응답을 실시간으로 청크 단위로 전송하여 체감 응답 속도 향상.
     Content-Type: text/event-stream
+
+    [왜 `/chat`와 로직이 일부 분리돼 있나]
+    - `/chat/stream`은 SSE 연결/프레임 생성 계약이 핵심이라 `/chat`의 DB 저장/TTS 후처리 흐름과 우선순위가 다르다.
+    - 1차 리팩토링에서는 응답 필드/SSE 동작 호환성이 더 중요해서 일부 구성 로직만 재사용한다.
+
+    [주의]
+    - 빈 대화/기본 프롬프트 동작은 `/chat`와 일부 다르게 유지될 수 있다(기존 동작 호환).
     """
     session_id = request.session_id or str(uuid.uuid4())
+    if principal and principal.kind == "guest" and principal.guest_session:
+        logger.info("Guest chat stream request session_id=%s guest_session_id=%s", session_id, principal.guest_session.id)
     
     # 시나리오 정보 추출 (기존 /chat 로직과 동일)
-    scenario = request.scenario or {}
-    opponent = scenario.get("opponent", "상대방")
-    situation = scenario.get("situation", "대화 중")
-    user_name = scenario.get("user_name", "사용자")
-    background = scenario.get("background")
+    scenario_fields = chat_service.extract_scenario_fields(
+        request.scenario,
+        default_user_name="사용자",
+    )
+    opponent = scenario_fields["opponent"] or "상대방"
+    situation = scenario_fields["situation"] or "대화 중"
+    user_name = scenario_fields["user_name"] or "사용자"
+    background = scenario_fields["background"]
     
     # 턴 카운트
     turn_count = len(request.messages) // 2
@@ -494,18 +642,13 @@ async def chat_stream(
     
     # 시스템 프롬프트 생성 (간소화 버전)
     if request.persona:
-        # resolved_character_name 추출
-        resolved_character_name = opponent
-        if request.character_id:
-            presets = load_preset_characters()
-            p = next((x for x in presets if x.get("id") == request.character_id), None)
-            if p:
-                resolved_character_name = p.get("name", resolved_character_name)
-            else:
-                r = await db.execute(select(Character).where(Character.id == request.character_id))
-                c = r.scalar_one_or_none()
-                if c:
-                    resolved_character_name = c.name
+        # resolved_character_name 추출 (Preset → DB 순서 정책은 service에 위임)
+        resolved_character_name, _ = await chat_service.resolve_character_identity(
+            character_id=request.character_id,
+            fallback_name=opponent,
+            db=db,
+            preset_loader=character_service.load_preset_characters_from_disk,
+        )
 
         system_prompt = format_persona_for_actor(
             character_name=resolved_character_name,
@@ -519,54 +662,21 @@ async def chat_stream(
         )
         messages.append({"role": "system", "content": system_prompt})
     
-    # 대화 기록 추가
-    for msg in request.messages:
-        role = "assistant" if msg.role == "ai" else msg.role
-        messages.append({"role": role, "content": msg.content})
+    # 대화 기록 추가 (정규화 규칙만 재사용; `/chat/stream`의 빈 대화 동작은 기존대로 유지)
+    stream_request_messages = chat_service.normalize_request_messages_for_context(request.messages)
+    for msg in stream_request_messages:
+        messages.append({"role": msg["role"], "content": msg["content"]})
     
-    # 시스템 프롬프트 분리
-    system_instruction = None
-    chat_messages = []
-    
-    for msg in messages:
-        if msg["role"] == "system":
-            if system_instruction:
-                system_instruction += "\n\n" + msg["content"]
-            else:
-                system_instruction = msg["content"]
-        else:
-            chat_messages.append(msg)
-
-    async def generate_sse():
-        """
-        SSE 이벤트 생성기.
-        각 청크를 data: {...} 형식으로 전송.
-        """
-        full_content = ""
-        try:
-            async for chunk in call_llm_stream(
-                messages=chat_messages,
-                model=request.model,
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-                system_instruction=system_instruction
-            ):
-                full_content += chunk
-                # SSE 형식: data: {...}\n\n
-                yield f"data: {json.dumps({'content': chunk, 'done': False})}\n\n"
-            
-            # 완료 신호 전송
-            yield f"data: {json.dumps({'content': '', 'done': True, 'full_content': full_content, 'session_id': session_id})}\n\n"
-            
-            # DB에 메시지 저장 (비동기 컨텍스트 외부에서 처리 필요 → 로그만 남김)
-            logger.info(f"스트리밍 완료: session={session_id}, length={len(full_content)}")
-            
-        except Exception as e:
-            logger.error(f"스트리밍 오류: {e}")
-            yield f"data: {json.dumps({'error': str(e), 'done': True})}\n\n"
+    # 시스템 프롬프트 분리 규칙은 `/chat`과 동일하게 유지
+    system_instruction, chat_messages = chat_service.split_system_and_chat_messages(messages)
 
     return StreamingResponse(
-        generate_sse(),
+        _generate_chat_stream_sse_events(
+            chat_messages=chat_messages,
+            request=request,
+            system_instruction=system_instruction,
+            session_id=session_id,
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

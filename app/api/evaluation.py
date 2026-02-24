@@ -6,8 +6,10 @@ from app.api.deps import get_db
 from app.core.llm import call_llm
 from app.services.context_manager import context_manager
 import json
+import logging
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 class Message(BaseModel):
     role: str
@@ -26,11 +28,18 @@ async def evaluate_chat(
     db: AsyncSession = Depends(get_db)  # DB 세션 주입
 ):
     """
-    [기능] 10턴 대화 종료 후 '캐릭터'가 직접 수행하는 중간 평가 및 요약
-    DB에 요약을 저장하여 영속성 보장.
+    [역할]
+    대화 기록을 캐릭터 시점으로 평가하고 요약/점수/피드백을 생성한 뒤 컨텍스트 요약을 저장한다.
+
+    [왜 여기서 처리하나]
+    이 엔드포인트는 "평가 LLM 호출 + 요약 영속화(context_manager)"를 한 번에 수행하는 오케스트레이션 경계다.
+    1차 리팩토링에서는 응답 shape를 유지하면서 단계 주석으로 흐름만 명확히 한다.
+
+    [주의]
+    평가/요약 실패 시에도 `success=True` fallback 응답을 반환하는 현재 UX 계약을 유지한다.
     """
     
-    # 1. 캐릭터 빙의 평가 프롬프트
+    # 1) 캐릭터 빙의 평가 프롬프트 구성
     system_prompt = f"""
     당신은 '{request.character_name}'입니다. 다음 페르소나를 완벽하게 연기하세요.
     
@@ -59,6 +68,7 @@ async def evaluate_chat(
     }}
     """
 
+    # 2) 대화 기록 직렬화 (LLM 입력용)
     dialogue_text = "\n".join([f"{msg.role}: {msg.content}" for msg in request.messages])
 
     messages = [
@@ -67,7 +77,7 @@ async def evaluate_chat(
     ]
 
     try:
-        # LLM 호출
+        # 3) 평가 LLM 호출 + JSON 파싱
         result = await call_llm(messages, temperature=0.7, max_tokens=800)
         
         content = result if isinstance(result, str) else result.get("content", "")
@@ -78,7 +88,7 @@ async def evaluate_chat(
             
         data = json.loads(content)
         
-        # 2. DB/Redis에 요약 저장 (Context Manager Upgrade)
+        # 4) DB/Redis 요약 갱신 (context_manager가 내부 저장소 fallback 정책을 캡슐화)
         # 이전 요약 가져오기 (DB에서)
         prev_summary = await context_manager.get_summary(request.session_id, db)
         
@@ -99,7 +109,9 @@ async def evaluate_chat(
         }
 
     except Exception as e:
-        print(f"Evaluation error: {e}")
+        # broad except 유지 이유:
+        # LLM 호출/JSON 파싱/요약 저장 중 어디서 실패하든 현재 UX 계약은 "fallback 평가 결과 반환"이기 때문이다.
+        logger.warning("Evaluation fallback used: %s", e)
         return {
             "success": True,
             "data": {

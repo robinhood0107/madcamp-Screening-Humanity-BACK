@@ -4,14 +4,9 @@ Server A의 GPT-SoVITS API를 직접 호출하여 TTS를 수행합니다.
 가중치 변경은 /tts/prepare 에서 처리하고, 실제 TTS 생성은 /tts 또는 내부 함수에서 수행합니다.
 """
 from fastapi import APIRouter, Depends, HTTPException, Response
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, validator
 from typing import List, Optional, Dict, Any
-import os
 import json
-import hashlib
-import uuid
-import httpx
 import logging
 from pathlib import Path
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,8 +14,7 @@ from sqlalchemy import select
 from app.core.config import settings
 from app.api.deps import get_db
 from app.models.user import User
-from app.models.audio import AudioFile
-from app.services.audio_analyzer import AudioAnalyzer
+from app.services import server_a_client, tts_service
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -37,9 +31,14 @@ async def prepare_tts_weights(
     """
     채팅 시작 전 TTS 모델 가중치를 미리 로드합니다.
     (voice_id에 해당하는 gpt_weights_path, sovits_weights_path를 Server A에 설정)
+
+    [왜 여기서 처리하나]
+    - 채팅 본 요청(`/chat`)에서 첫 TTS 호출 지연을 줄이기 위한 "선행 준비" 성격 엔드포인트다.
+    - 가중치 설정 실패가 곧바로 채팅 전체 실패로 이어지지 않도록, 경고/부분 성공 정책을 유지한다.
+
+    [주의]
+    - 레거시 JSON voice config 경로는 가중치 경로를 보통 갖지 않으므로 "성공이지만 준비 스킵" 응답이 나올 수 있다.
     """
-    tts_base_url = settings.TTS_BASE_URL
-    
     # DB 조회
     voice_data = await get_voice_from_db(request.voice_id, db)
     if not voice_data:
@@ -56,20 +55,29 @@ async def prepare_tts_weights(
     gpt_weights = voice_data.get("gpt_weights_path")
     sovits_weights = voice_data.get("sovits_weights_path")
     
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        if gpt_weights:
-            try:
-                await client.get(f"{tts_base_url}/set_gpt_weights", params={"weights_path": gpt_weights})
-                logger.info(f"Loaded GPT weights for {request.voice_id}")
-            except Exception as e:
-                logger.error(f"Failed to set GPT weights: {e}")
-                
-        if sovits_weights:
-            try:
-                await client.get(f"{tts_base_url}/set_sovits_weights", params={"weights_path": sovits_weights})
-                logger.info(f"Loaded SoVITS weights for {request.voice_id}")
-            except Exception as e:
-                logger.error(f"Failed to set SoVITS weights: {e}")
+    if gpt_weights:
+        try:
+            gpt_resp = await server_a_client.set_tts_gpt_weights(weights_path=gpt_weights, timeout=10.0)
+            if gpt_resp.status_code == 200:
+                logger.info("Loaded GPT weights for %s", request.voice_id)
+            else:
+                logger.error("Failed to set GPT weights: status=%s body=%s", gpt_resp.status_code, gpt_resp.text)
+        except HTTPException as e:
+            logger.warning("Failed to set GPT weights (request error): %s", e.detail)
+        except Exception as e:
+            logger.exception("Failed to set GPT weights: %s", e)
+
+    if sovits_weights:
+        try:
+            sovits_resp = await server_a_client.set_tts_sovits_weights(weights_path=sovits_weights, timeout=10.0)
+            if sovits_resp.status_code == 200:
+                logger.info("Loaded SoVITS weights for %s", request.voice_id)
+            else:
+                logger.error("Failed to set SoVITS weights: status=%s body=%s", sovits_resp.status_code, sovits_resp.text)
+        except HTTPException as e:
+            logger.warning("Failed to set SoVITS weights (request error): %s", e.detail)
+        except Exception as e:
+            logger.exception("Failed to set SoVITS weights: %s", e)
                 
     return {"success": True, "message": f"Weights prepared for {request.voice_id}"}
 
@@ -77,7 +85,16 @@ async def prepare_tts_weights(
 _voices_config = None
 
 def load_voices_config():
-    """voice_id 매핑 설정 파일 로드"""
+    """
+    [역할]
+    레거시 `voices.json` 설정을 로드/캐시한다.
+
+    [왜 여기서 처리하나]
+    - DB 기반 voice 관리 이전 경로(`voice_id -> ref_audio_path`) 호환을 1차에서 유지하기 위해서다.
+
+    [주의]
+    - 파일 미존재 시 예외 대신 기본 config를 반환한다(레거시 호환).
+    """
     global _voices_config
     if _voices_config is None:
         config_path = Path(__file__).parent.parent / "config" / "voices.json"
@@ -92,7 +109,16 @@ def load_voices_config():
     return _voices_config
 
 def get_ref_audio_path(voice_id: Optional[str] = None) -> Optional[str]:
-    """voice_id로 ref_audio_path 조회 (JSON 파일 기반 - 레거시)"""
+    """
+    [역할]
+    레거시 `voices.json` 기준으로 `voice_id -> ref_audio_path`를 조회한다.
+
+    [왜 여기서 처리하나]
+    - `tts_service.resolve_tts_request_defaults()`에서 DB 음성 설정이 없을 때 fallback resolver로 주입된다.
+
+    [주의]
+    - DB 우선 정책 이후의 fallback 경로이므로, 신규 기능은 이 함수에 의존하지 않도록 유지한다.
+    """
     config = load_voices_config()
     
     if voice_id is None:
@@ -106,26 +132,11 @@ def get_ref_audio_path(voice_id: Optional[str] = None) -> Optional[str]:
 
 
 async def get_voice_from_db(voice_id: str, db: AsyncSession) -> Optional[Dict[str, Any]]:
-    """DB에서 voice_id로 음성 정보 조회"""
-    from app.models.voice import Voice
-    
-    result = await db.execute(
-        select(Voice).where(Voice.id == voice_id, Voice.is_active == True)
-    )
-    voice = result.scalar_one_or_none()
-    
-    if voice:
-        return {
-            "id": voice.id,
-            "name": voice.name,
-            "ref_audio_path": voice.ref_audio_path,
-            "gpt_weights_path": voice.gpt_weights_path,
-            "sovits_weights_path": voice.sovits_weights_path,
-            "prompt_text": voice.prompt_text,
-            "prompt_lang": voice.prompt_lang,
-            "language": voice.language
-        }
-    return None
+    """
+    [역할]
+    라우터 호환용 wrapper. 실제 DB 조회/직렬화는 `tts_service`가 담당한다.
+    """
+    return await tts_service.get_voice_from_db_dict(voice_id, db)
 
 
 class TTSRequest(BaseModel):
@@ -181,150 +192,57 @@ async def _synthesize_tts_internal(
     TTS 합성 내부 함수 (Chat API 등에서 사용).
     항상 전체 오디오를 생성하여 파일로 저장하고 URL을 반환합니다.
     (Worker Queue를 경유하여 모델 로드 순서를 보장받습니다.)
+
+    [왜 여기서 처리하나]
+    - `chat.py` 등 내부 호출자가 `/tts` 공개 라우터의 binary/json 분기 로직을 알 필요 없이
+      "성공 시 저장된 audio_url 반환" 계약만 사용하게 하기 위한 내부 오케스트레이션 wrapper다.
+
+    [부작용]
+    - DB 조회(voice lookup/cache)
+    - 외부 HTTP(Server A TTS)
+    - 파일 저장/오디오 분석/DB 캐시 저장 (service 경유)
+
+    [실패/예외]
+    - `HTTPException`은 그대로 올리고, `ValueError`는 400, 나머지는 500으로 매핑한다.
+      (기존 `TTS Error: ...` detail prefix 계약 유지)
+
+    [주의]
+    - 반환 shape는 `{"success": True, "data": ...}` 고정. `chat.py`가 이 구조를 직접 참조한다.
     """
     try:
-        # DB에서 Voice 정보 조회 및 보정
-        if request.voice_id and not request.ref_audio_path:
-            voice_data = await get_voice_from_db(request.voice_id, db)
-            if voice_data:
-                request.ref_audio_path = voice_data["ref_audio_path"]
-                request.prompt_text = voice_data.get("prompt_text") or request.prompt_text
-                request.prompt_lang = voice_data.get("prompt_lang") or request.prompt_lang
-                if not request.gpt_weights_path:
-                    request.gpt_weights_path = voice_data.get("gpt_weights_path")
-                if not request.sovits_weights_path:
-                    request.sovits_weights_path = voice_data.get("sovits_weights_path")
-            else:
-                ref_path = get_ref_audio_path(request.voice_id)
-                if ref_path:
-                    request.ref_audio_path = ref_path
-                else:
-                    raise ValueError(f"유효하지 않은 voice_id입니다: {request.voice_id}")
+        await tts_service.resolve_tts_request_defaults(
+            request=request,
+            db=db,
+            legacy_ref_audio_resolver=get_ref_audio_path,
+        )
+        tts_service.validate_tts_request_ready(request)
 
-        if not request.ref_audio_path:
-             raise ValueError("참조 오디오 경로(ref_audio_path)가 필요합니다.")
+        cached = await tts_service.lookup_cached_tts_audio_response(
+            request=request,
+            current_user=current_user,
+            db=db,
+        )
+        if cached:
+            return {"success": True, "data": cached}
 
-        # 캐시 체크 (로그인 유저만)
-        text_hash = hashlib.sha256(request.text.encode("utf-8")).hexdigest()
-        if not request.return_binary and current_user is not None:
-            result = await db.execute(
-                select(AudioFile).where(
-                    AudioFile.text_hash == text_hash,
-                    AudioFile.voice_id == (request.voice_id or "default"),
-                    AudioFile.format == request.media_type
-                )
-            )
-            cached_audio = result.scalar_one_or_none()
-            if cached_audio:
-                return {
-                    "success": True,
-                    "data": {
-                        "audio_url": cached_audio.file_url,
-                        "cached": True,
-                        "duration": cached_audio.duration,
-                        "format": cached_audio.format
-                    }
-                }
-
-        # Server A TTS API 직접 호출 (Redis Queue 우회)
-        # 가중치 변경 로직은 /tts/prepare 에서 처리하므로 여기서는 생략
-        tts_base_url = settings.TTS_BASE_URL
-        
-        async with httpx.AsyncClient(timeout=settings.TTS_TIMEOUT) as client:
-            # TTS 요청 (POST /tts)
-            tts_body = request.model_dump_for_gpt_sovits()
-            # logger.info(f"TTS 요청: text={tts_body.get('text')[:30]}...")
-            
-            # Debug: Request Body 확인
-            print(f"[TTS DEBUG] Payload: {json.dumps(tts_body, ensure_ascii=False)}")
-            
-            try:
-                tts_response = await client.post(
-                    f"{tts_base_url}/tts",
-                    json=tts_body
-                )
-                tts_response.raise_for_status()
-                audio_content = tts_response.content
-            except httpx.HTTPStatusError as e:
-                print(f"[TTS ERROR] Status: {e.response.status_code}, Body: {e.response.text}")
-                raise HTTPException(status_code=e.response.status_code, detail=f"TTS Server Error: {e.response.text}")
-            
-        if not audio_content:
-            raise HTTPException(status_code=500, detail="TTS 생성 결과가 비어있습니다.")
-
-        # 파일 저장 로직 (기존과 동일)
-        file_id = str(uuid.uuid4())
-        file_ext = request.media_type
-        max_file_size = settings.TTS_MAX_FILE_SIZE
-        if len(audio_content) > max_file_size:
-             raise HTTPException(status_code=413, detail="File too large")
-
-        if current_user is None:
-            # 비로그인: anonymous
-            audio_dir = Path(settings.USER_ASSETS_DIR) / "audio" / "anonymous"
-            audio_dir.mkdir(parents=True, exist_ok=True)
-            file_name = f"anon_{file_id}.{file_ext}"
-            file_path = audio_dir / file_name
-            file_url = f"/assets/audio/anonymous/{file_name}"
-            with open(file_path, "wb") as f:
-                f.write(audio_content)
-            
-            analyzer = AudioAnalyzer()
-            audio_info = analyzer.analyze_audio(str(file_path))
-            
-            return {
-                "success": True,
-                "data": {
-                    "audio_url": file_url,
-                    "file_id": file_id,
-                    "duration": audio_info["duration"],
-                    "format": audio_info["format"],
-                    "cached": False
-                }
-            }
-        else:
-            # 로그인 유저
-            audio_dir = Path(settings.USER_ASSETS_DIR) / "audio" / current_user.id
-            audio_dir.mkdir(parents=True, exist_ok=True)
-            file_name = f"{current_user.id}_{file_id}.{file_ext}"
-            file_path = audio_dir / file_name
-            file_url = f"/assets/audio/{current_user.id}/{file_name}"
-            with open(file_path, "wb") as f:
-                f.write(audio_content)
-                
-            analyzer = AudioAnalyzer()
-            audio_info = analyzer.analyze_audio(str(file_path))
-            
-            audio_file = AudioFile(
-                id=file_id,
-                user_id=current_user.id,
-                file_path=str(file_path),
-                file_url=file_url,
-                file_size=audio_info["file_size"],
-                duration=audio_info["duration"],
-                format=audio_info["format"],
-                voice_id=request.voice_id or "default",
-                text_hash=text_hash
-            )
-            db.add(audio_file)
-            await db.commit()
-            await db.refresh(audio_file)
-            
-            return {
-                "success": True,
-                "data": {
-                    "audio_url": audio_file.file_url,
-                    "file_id": audio_file.id,
-                    "cached": False,
-                    "duration": audio_file.duration
-                }
-            }
-
+        audio_content = await tts_service.call_tts_binary_or_raise(
+            request=request,
+            error_prefix="TTS Server Error",
+        )
+        data = await tts_service.save_tts_audio_and_optionally_cache(
+            audio_content=audio_content,
+            request=request,
+            current_user=current_user,
+            db=db,
+        )
+        return {"success": True, "data": data}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"TTS Error: {str(e)}") from e
     except Exception as e:
-        # 에러 처리
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"TTS Error: {str(e)}")
+        logger.exception("TTS internal synthesis failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"TTS Error: {str(e)}") from e
 
 
 @router.post("/tts")
@@ -332,81 +250,49 @@ async def synthesize(request: TTSRequest, db: AsyncSession = Depends(get_db)):
     """
     공개 TTS 엔드포인트.
     streaming_mode > 0 또는 return_binary=True 시 StreamingResponse 반환.
+
+    [왜 내부 helper와 분리하나]
+    - 공개 라우터는 transport 역할(요청 검증, binary/json 응답 분기, HTTPException 매핑)만 담당하고,
+      실제 합성/파일 저장/캐시 로직은 `tts_service` helper로 위임한다.
+
+    [주의]
+    - `/tts`는 `return_binary` 여부에 따라 응답 형태가 달라지므로, 내부 helper 반환을 그대로 노출하지 않는다.
     """
     try:
-        # DB 정보 보정
-        if request.voice_id and not request.ref_audio_path:
-            voice_data = await get_voice_from_db(request.voice_id, db)
-            if voice_data:
-                request.ref_audio_path = voice_data["ref_audio_path"]
-                request.prompt_text = voice_data.get("prompt_text") or request.prompt_text or ""
-                request.prompt_lang = voice_data.get("prompt_lang") or request.prompt_lang
-                if not request.gpt_weights_path:
-                    request.gpt_weights_path = voice_data.get("gpt_weights_path")
-                if not request.sovits_weights_path:
-                    request.sovits_weights_path = voice_data.get("sovits_weights_path")
-            else:
-                ref_path = get_ref_audio_path(request.voice_id)
-                if ref_path:
-                    request.ref_audio_path = ref_path
-                else:
-                    raise ValueError(f"유효하지 않은 voice_id입니다: {request.voice_id}")
-        
-        if not request.ref_audio_path:
-            raise ValueError("ref_audio_path required")
+        await tts_service.resolve_tts_request_defaults(
+            request=request,
+            db=db,
+            legacy_ref_audio_resolver=get_ref_audio_path,
+        )
+        tts_service.validate_tts_request_ready(request)
 
-        # Server A TTS API 직접 호출 (Redis Queue 우회)
-        # 가중치 변경 로직은 /tts/prepare 에서 처리하므로 여기서는 생략하고 바로 TTS 요청
-        tts_base_url = settings.TTS_BASE_URL
-        
-        async with httpx.AsyncClient(timeout=settings.TTS_TIMEOUT) as client:
-            # TTS 요청 (POST /tts)
-            tts_body = request.model_dump_for_gpt_sovits()
-            # Debug: Request Body 확인
-            print(f"[TTS DEBUG] Payload: {json.dumps(tts_body, ensure_ascii=False)}")
+        audio_content = await tts_service.call_tts_binary_or_raise(
+            request=request,
+            error_prefix="TTS Server Error",
+        )
 
-            try:
-                tts_response = await client.post(
-                    f"{tts_base_url}/tts",
-                    json=tts_body
-                )
-                tts_response.raise_for_status()
-                audio_content = tts_response.content
-            except httpx.HTTPStatusError as e:
-                print(f"[TTS ERROR] Status: {e.response.status_code}, Body: {e.response.text}")
-                raise HTTPException(status_code=e.response.status_code, detail=f"TTS Server Error: {e.response.text}")
-        
-        # 스트리밍 응답 (바이너리 직접 반환)
         if request.return_binary:
-            media_type_map = {
-                "wav": "audio/wav",
-                "ogg": "audio/ogg",
-                "aac": "audio/aac",
-                "raw": "audio/raw"
-            }
-            content_type = media_type_map.get(request.media_type, "audio/wav")
-            
             return Response(
                 content=audio_content,
-                media_type=content_type,
-                headers={"Content-Disposition": f"attachment; filename=tts_output.{request.media_type}"}
+                media_type=tts_service.media_type_for_audio_format(request.media_type),
+                headers={"Content-Disposition": f"attachment; filename=tts_output.{request.media_type}"},
             )
-        
-        # JSON 응답 (Base64)
-        import base64
-        audio_base64 = base64.b64encode(audio_content).decode("utf-8")
-        
+
         return {
             "success": True,
-            "data": {
-                "audio_base64": audio_base64,
-                "format": request.media_type,
-                "voice_id": request.voice_id or "default"
-            }
+            "data": tts_service.build_public_tts_json_response(
+                audio_content=audio_content,
+                media_type=request.media_type,
+                voice_id=request.voice_id,
+            ),
         }
-
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"TTS Error: {str(e)}") from e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"TTS Error: {str(e)}")
+        logger.exception("Public TTS synthesis failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"TTS Error: {str(e)}") from e
 
 
 @router.get("/tts/voices")

@@ -5,6 +5,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Avatar Forge Backend"
     API_V1_STR: str = "/api"
+    APP_ENV: str = "development"
     
     # CORS
     BACKEND_CORS_ORIGINS: List[AnyHttpUrl] = ["http://localhost:3000"]
@@ -39,26 +40,56 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_ID: str = ""
     GOOGLE_CLIENT_SECRET: str = ""
     GOOGLE_REDIRECT_URI: str = "http://localhost:8000/api/auth/google/callback"
+    # [보안 플래그] 로컬 개발 환경에서만 True를 권장.
+    # 운영(HTTPS)에서는 False로 내려야 Google OAuth 흐름이 더 안전해진다.
+    GOOGLE_SSO_ALLOW_INSECURE_HTTP: bool = True
     
     # AI API Keys
     GEMINI_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
+    # Gemini 기본 모델 (Backend에서 Gemini 호출 시 기본값으로 사용)
+    GOOGLE_API_MODEL: str = "gemini-2.5-flash"
+    # Gemini Safety Threshold (google-generativeai HarmBlockThreshold enum name)
+    # 예: BLOCK_NONE / BLOCK_ONLY_HIGH / BLOCK_MEDIUM_AND_ABOVE / BLOCK_LOW_AND_ABOVE / HARM_BLOCK_THRESHOLD_UNSPECIFIED
+    GOOGLE_SAFETY_THRESHOLD: str = "BLOCK_NONE"
     
     @validator("GEMINI_API_KEY", pre=True, always=True)
     def set_gemini_api_key(cls, v, values):
         import os
+        import warnings
         if v:
             return v
+        if os.environ.get("NEXT_PUBLIC_GEMINI_API_KEY"):
+            warnings.warn(
+                "NEXT_PUBLIC_GEMINI_API_KEY is ignored by security policy. "
+                "Move the Gemini secret to Backend .env as GEMINI_API_KEY (or GOOGLE_API_KEY legacy alias).",
+                RuntimeWarning,
+            )
         # 여러 환경 변수 이름 시도
         return (
-            os.getenv("GOOGLE_API_KEY") or 
             os.getenv("GEMINI_API_KEY") or 
-            os.getenv("NEXT_PUBLIC_GEMINI_API_KEY") or 
+            os.getenv("GOOGLE_API_KEY") or 
             ""
         )
     
     # Frontend URL (OAuth 콜백 리다이렉트용)
     FRONTEND_URL: str = "http://localhost:3000"
+    BACKEND_PUBLIC_URL: str = ""  # 선택값: 비어 있으면 GOOGLE_REDIRECT_URI 사용
+    
+    # Auth Cookie / 보안 동작 (1차 리팩토링: 기본값은 기존 동작 유지)
+    # 여기 값들을 둔 이유:
+    # - auth.py에 하드코딩돼 있던 보안 민감 옵션을 설정으로 끌어올려서
+    #   운영에서 코드 수정 없이 조정 가능하게 하려는 목적이다.
+    AUTH_COOKIE_NAME: str = "access_token"
+    AUTH_COOKIE_SECURE: bool = False
+    AUTH_COOKIE_SAMESITE: str = "lax"
+    DEV_AUTH_FALLBACK_ENABLED: bool = True  # 토큰 실패 시 dev-user 폴백 (운영에서는 False 권장)
+    STRICT_STARTUP_VALIDATION: bool = False  # 1차는 warn-only 정책
+    STARTUP_SCHEMA_PATCH_ENABLED: bool = True  # main.py의 ad-hoc DDL 패치 토글
+    GUEST_AUTH_ENABLED: bool = True
+    GUEST_AUTH_COOKIE_NAME: str = "guest_access_token"
+    GUEST_ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 1 day
+    GUEST_COOKIE_SESSION_ONLY: bool = True
 
     # LLM 서비스 설정
     # "vllm" 또는 "ollama" 중 선택 (동시 실행 불가, VRAM 제약)
@@ -107,6 +138,17 @@ class Settings(BaseSettings):
             return False
         admin_list = [e.strip().lower() for e in self.ADMIN_EMAILS.split(",") if e.strip()]
         return email.lower() in admin_list
+
+    @validator("AUTH_COOKIE_SAMESITE", pre=True)
+    def normalize_auth_cookie_samesite(cls, v: Optional[str]) -> str:
+        """
+        samesite 값을 FastAPI/Starlette가 기대하는 소문자 문자열로 정규화.
+        잘못된 값이 들어와도 기존 동작(lax)으로 폴백해서 서버 부팅이 깨지지 않게 유지한다.
+        """
+        raw = (v or "lax").strip().lower()
+        if raw not in {"lax", "strict", "none"}:
+            return "lax"
+        return raw
     
     # Server A 파일 스캔 API (GPT-SoVITS 모델/음성 파일 조회용)
     # 프록시 사용 시 포트 없이 gpufilemanager.duckdns.org, /api/health·/api/files/* 라우팅
@@ -114,6 +156,7 @@ class Settings(BaseSettings):
 
     # Server A 학습 API (GPT-SoVITS 모델 학습용). 프록시: gpuvoicetrain.duckdns.org
     SERVER_A_TRAINING_API_URL: str = "http://gpuvoicetrain.duckdns.org"
+    SERVER_A_STACK_MODE: str = ""  # 선택값: docker|host (문서/운영 로깅용)
 
     # Server A 경로 (model-make 업로드/삭제용). file_scanner_api·training_api와 동일한 값 사용
     SERVER_A_TRAIN_VOICE_ROOT: str = "/opt/GPT-SoVITS/sample_train_voice"
@@ -133,6 +176,47 @@ class Settings(BaseSettings):
     TTS_QUEUE_MAX_SIZE: int = 100
     TTS_QUEUE_JOB_TIMEOUT: int = 60  # 초
     TTS_RESULT_TTL: int = 300  # 5분
+
+    @staticmethod
+    def _rstrip_slash(url: str) -> str:
+        return (url or "").rstrip("/")
+
+    @property
+    def backend_cors_allow_origins(self) -> List[str]:
+        origins = [str(origin).rstrip("/") for origin in self.BACKEND_CORS_ORIGINS]
+        return origins or ["http://localhost:3000"]
+
+    @property
+    def frontend_base_url(self) -> str:
+        return self._rstrip_slash(self.FRONTEND_URL or "http://localhost:3000")
+
+    @property
+    def auth_cookie_name(self) -> str:
+        return (self.AUTH_COOKIE_NAME or "access_token").strip() or "access_token"
+
+    @property
+    def guest_auth_cookie_name(self) -> str:
+        return (self.GUEST_AUTH_COOKIE_NAME or "guest_access_token").strip() or "guest_access_token"
+
+    @property
+    def auth_cookie_samesite_value(self) -> str:
+        return (self.AUTH_COOKIE_SAMESITE or "lax").strip().lower() or "lax"
+
+    @property
+    def app_env_normalized(self) -> str:
+        return (self.APP_ENV or "development").strip().lower() or "development"
+
+    @property
+    def server_a_files_api_base_url(self) -> str:
+        return self._rstrip_slash(self.SERVER_A_FILES_API_URL or "http://localhost:10001")
+
+    @property
+    def server_a_training_api_base_url(self) -> str:
+        return self._rstrip_slash(self.SERVER_A_TRAINING_API_URL or "http://localhost:10002")
+
+    @property
+    def redis_url_value(self) -> str:
+        return (self.REDIS_URL or "redis://localhost:6379/0").strip()
 
     model_config = SettingsConfigDict(
         env_file=".env", 

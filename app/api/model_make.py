@@ -5,12 +5,12 @@
 import io
 import uuid
 import time
+import logging
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, status, UploadFile
 from pydantic import BaseModel, Field
 from mutagen.wave import WAVE
-import httpx
 
 from app.api.deps import get_db, get_current_user
 from app.core.config import settings
@@ -19,8 +19,10 @@ from app.models.user import User
 from app.models.character import Character
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from app.services import server_a_client
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 MAX_TOTAL_BYTES = 100 * 1024 * 1024  # 100MB
 MIN_DURATION_SEC = 5.0
@@ -56,11 +58,56 @@ class ModelMakeRegisterRequest(BaseModel):
 
 def _get_duration_sec(data: bytes, filename: str) -> Optional[float]:
     """mutagen으로 WAV 재생시간(초) 반환. 실패 시 None."""
+    # [왜 여기서 처리하나]
+    # 업로드 검증에서 "읽을 수 없는 WAV"를 빠르게 걸러야 하므로 라우터 바로 옆의 순수 helper로 둔다.
+    # 실패 시 None을 반환해 호출부가 400 응답 메시지를 일관되게 구성한다.
     try:
         info = WAVE(io.BytesIO(data)).info
         return info.length if info else None
     except Exception:
         return None
+
+
+async def _resolve_ref_audio_file_with_prepare_fallback(
+    *,
+    train_input_dir: str,
+    original_ref_audio_file: str,
+) -> str:
+    """
+    [역할]
+    Server A `prepare-ref-audio`를 시도하고 실패하면 원본 ref_audio 파일명을 유지한다.
+
+    [왜 helper로 분리하나]
+    - `/register`에서 "실패해도 계속 진행" 정책은 유지하되, 로깅/예외 흡수 규칙을 한곳에 고정해
+      오케스트레이션 본문 길이와 중복을 줄인다.
+
+    [주의]
+    - non-200/연결 실패/파싱 오류 모두 원본 파일명으로 폴백한다. (기존 UX 계약 유지)
+    """
+    try:
+        prepare_resp = await server_a_client.prepare_ref_audio(
+            data={
+                "train_input_dir": train_input_dir,
+                "max_duration_sec": 10.0,  # 10초로 제한
+            },
+            timeout=30.0,
+        )
+        if prepare_resp.status_code != 200:
+            logger.warning("prepare-ref-audio failed: %s", prepare_resp.text)
+            return original_ref_audio_file
+
+        prepare_data = prepare_resp.json()
+        if prepare_data.get("success"):
+            logger.info("ref_audio prepared: %s", prepare_data)
+            return prepare_data.get("ref_audio_file", original_ref_audio_file)
+
+        return original_ref_audio_file
+    except HTTPException as e:
+        logger.warning("prepare-ref-audio error: %s", e.detail)
+        return original_ref_audio_file
+    except Exception as e:
+        logger.warning("prepare-ref-audio error: %s", e)
+        return original_ref_audio_file
 
 
 # ============ POST /upload ============
@@ -75,6 +122,11 @@ async def upload_training_files(
     - 3개 이상, .wav만, 한 번에 총 100MB 이하, 각 5초 이상(mutagen). 실패 시 400.
     - Server A sample_train_voice/{user_id}/run_{ts} 형태로 저장.
     """
+    # [왜 여기서 처리하나]
+    # 업로드 전 검증(개수/확장자/총용량/길이)을 라우터에서 끝내면 Server A에 불필요한 네트워크/디스크 작업을 줄일 수 있다.
+    #
+    # [주의]
+    # 반환값의 `train_input_dir`, `first_file`은 이후 /start, /register 흐름에서 그대로 이어진다.
     if len(files) < 3:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -129,25 +181,21 @@ async def upload_training_files(
     ts = int(time.time_ns() // 1000)
     sub_path = f"user_{current_user.id}/run_{ts}"
     root = getattr(settings, "SERVER_A_TRAIN_VOICE_ROOT", "/opt/GPT-SoVITS/sample_train_voice")
-    api_url = settings.SERVER_A_FILES_API_URL.rstrip("/")
-    upload_url = f"{api_url}/api/files/upload"
-
     first_file: Optional[str] = None
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        for name, data in items:
-            f = ("file", (name, io.BytesIO(data), "audio/wav"))
-            resp = await client.post(
-                upload_url,
-                data={"category": "train_voice", "sub_path": sub_path, "model_version": "v2"},
-                files=[f],
-            )
-            if resp.status_code != 200:
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"Server A 업로드 실패({name}): {resp.text}",
-                )
-            if first_file is None:
-                first_file = name
+    for name, data in items:
+        f = ("file", (name, io.BytesIO(data), "audio/wav"))
+        resp = await server_a_client.upload_training_item(
+            files=[f],
+            sub_path=sub_path,
+            model_version="v2",
+            timeout=120.0,
+        )
+        server_a_client.ensure_success_response(
+            resp,
+            error_prefix=f"Server A 업로드 실패({name})",
+        )
+        if first_file is None:
+            first_file = name
 
     return {
         "success": True,
@@ -169,15 +217,18 @@ async def start_training(
     current_user: User = Depends(get_current_user),
 ):
     """학습 시작. upload_path = SERVER_A_TRAIN_VOICE_ROOT / train_input_dir 로 Server A /api/train/start 호출."""
+    # [왜 여기서 처리하나]
+    # 프론트는 train_input_dir만 알고 있으므로 실제 Server A upload_path 조합은 백엔드에서 단일 규칙으로 만든다.
+    #
+    # [주의]
+    # 여기 payload 기본값(batch_size/epoch 등)은 현재 UX와 문서 기준선의 암묵 계약이라 1차에서 바꾸지 않는다.
     if body.version not in MODEL_VERSIONS_WHITELIST:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"지원하는 모델 버전: {', '.join(sorted(MODEL_VERSIONS_WHITELIST))}. 받음: {body.version}",
         )
-    root = getattr(settings, "SERVER_A_TRAIN_VOICE_ROOT", "/opt/GPT-SoVITS/sample_train_voice")
+    root = settings.SERVER_A_TRAIN_VOICE_ROOT
     upload_path = f"{root.rstrip('/')}/{body.train_input_dir.lstrip('/')}"
-    api_url = (getattr(settings, "SERVER_A_TRAINING_API_URL", None) or "http://localhost:10002").rstrip("/")
-    url = f"{api_url}/api/train/start"
     payload = {
         "model_name": body.model_name,
         "upload_path": upload_path,
@@ -188,14 +239,9 @@ async def start_training(
         "gpu_numbers": "0-0",
         "dry_run": False,
     }
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(url, json=payload)
-            if r.status_code != 200:
-                raise HTTPException(status_code=r.status_code, detail=f"학습 시작 실패: {r.text}")
-            return r.json()
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Server A 학습 API 연결 실패: {str(e)}")
+    r = await server_a_client.start_training(payload=payload, timeout=30.0)
+    server_a_client.ensure_success_response(r, error_prefix="학습 시작 실패")
+    return r.json()
 
 
 # ============ POST /abort ============
@@ -209,29 +255,30 @@ async def abort_training(
     모델 제작 중단(트랜잭션 롤백): 업로드 음성(train_input_dir), logs, TEMP 삭제.
     Voice 등록 전 중도 이탈 시 호출. get_current_user 필수.
     """
-    root_train = getattr(settings, "SERVER_A_TRAIN_VOICE_ROOT", "/opt/GPT-SoVITS/sample_train_voice")
-    root_logs = getattr(settings, "SERVER_A_LOGS_ROOT", "/opt/GPT-SoVITS/logs")
-    root_temp = getattr(settings, "SERVER_A_TEMP_ROOT", "/opt/GPT-SoVITS/TEMP")
-    api_url = settings.SERVER_A_FILES_API_URL.rstrip("/")
-    del_url = f"{api_url}/api/files"
+    # [왜 여기서 처리하나]
+    # 모델 제작 플로우 중단 시 "최대한 정리하고 성공 반환"이 UX 계약이라, 삭제 실패 일부는 흡수하고 계속 진행한다.
+    #
+    # [주의]
+    # 존재하지 않는 경로(404)는 실패로 취급하지 않는다. 재시도/중복 클릭을 허용하기 위한 정책이다.
+    root_train = settings.SERVER_A_TRAIN_VOICE_ROOT
+    root_logs = settings.SERVER_A_LOGS_ROOT
+    root_temp = settings.SERVER_A_TEMP_ROOT
+    # 1) train_input_dir (업로드 음성 폴더)
+    path_train = f"{root_train.rstrip('/')}/{body.train_input_dir.lstrip('/')}"
+    try:
+        await server_a_client.delete_file(path=path_train, timeout=15.0)
+    except HTTPException:
+        pass  # 존재하지 않거나 실패해도 계속
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        # 1) train_input_dir (업로드 음성 폴더)
-        path_train = f"{root_train.rstrip('/')}/{body.train_input_dir.lstrip('/')}"
-        try:
-            await client.delete(del_url, params={"path": path_train})
-        except httpx.RequestError:
-            pass  # 존재하지 않거나 실패해도 계속
-
-        # 2) logs/{model_name}, TEMP/{model_name} (학습 시작한 경우만)
-        if body.model_name and body.model_name.strip():
-            mn = body.model_name.strip()
-            for base, label in [(root_logs, "logs"), (root_temp, "TEMP")]:
-                path = f"{base.rstrip('/')}/{mn}"
-                try:
-                    await client.delete(del_url, params={"path": path})
-                except httpx.RequestError:
-                    pass
+    # 2) logs/{model_name}, TEMP/{model_name} (학습 시작한 경우만)
+    if body.model_name and body.model_name.strip():
+        mn = body.model_name.strip()
+        for base, label in [(root_logs, "logs"), (root_temp, "TEMP")]:
+            path = f"{base.rstrip('/')}/{mn}"
+            try:
+                await server_a_client.delete_file(path=path, timeout=15.0)
+            except HTTPException:
+                pass
 
     return {"success": True, "message": "중단되었고, 업로드·학습 관련 리소스가 삭제 요청되었습니다."}
 
@@ -244,18 +291,13 @@ async def get_training_status(
     current_user: User = Depends(get_current_user),
 ):
     """학습 상태 조회 (Server A /api/train/status/{model_name} 프록시)."""
-    api_url = (getattr(settings, "SERVER_A_TRAINING_API_URL", None) or "http://localhost:10002").rstrip("/")
-    url = f"{api_url}/api/train/status/{model_name}"
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(url)
-            if r.status_code == 404:
-                raise HTTPException(status_code=404, detail="학습 상태를 찾을 수 없습니다.")
-            if r.status_code != 200:
-                raise HTTPException(status_code=r.status_code, detail=r.text)
-            return r.json()
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Server A 연결 실패: {str(e)}")
+    r = await server_a_client.get_training_status(model_name=model_name, timeout=10.0)
+    server_a_client.ensure_success_response(
+        r,
+        error_prefix="학습 상태 조회 실패",
+        allow_404_detail="학습 상태를 찾을 수 없습니다.",
+    )
+    return r.json()
 
 
 @router.get("/log/{model_name}")
@@ -264,18 +306,13 @@ async def get_training_log(
     current_user: User = Depends(get_current_user),
 ):
     """학습 로그 조회 (Server A /api/train/log/{model_name} 프록시)."""
-    api_url = (getattr(settings, "SERVER_A_TRAINING_API_URL", None) or "http://localhost:10002").rstrip("/")
-    url = f"{api_url}/api/train/log/{model_name}"
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(url)
-            if r.status_code == 404:
-                raise HTTPException(status_code=404, detail="로그를 찾을 수 없습니다.")
-            if r.status_code != 200:
-                raise HTTPException(status_code=r.status_code, detail=r.text)
-            return r.json()
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Server A 연결 실패: {str(e)}")
+    r = await server_a_client.get_training_log(model_name=model_name, timeout=10.0)
+    server_a_client.ensure_success_response(
+        r,
+        error_prefix="학습 로그 조회 실패",
+        allow_404_detail="로그를 찾을 수 없습니다.",
+    )
+    return r.json()
 
 
 # ============ POST /register ============
@@ -287,58 +324,38 @@ async def register_voice(
     current_user: User = Depends(get_current_user),
 ):
     """학습 완료 후 Voice 등록. ref_audio_path = SERVER_A_TRAIN_VOICE_ROOT/train_input_dir/ref_audio_file. gpt/sovits 미지정 시 GET /api/files/logs에서 model_name 매칭으로 자동 추론."""
-    root = getattr(settings, "SERVER_A_TRAIN_VOICE_ROOT", "/opt/GPT-SoVITS/sample_train_voice")
+    # [왜 여기서 처리하나]
+    # /register는 "학습 산출물 -> 서비스 Voice 엔티티"로 넘어가는 경계라서,
+    # ref_audio 보정/가중치 자동 추론/DB 등록을 한 곳에서 오케스트레이션한다.
+    #
+    # [주의]
+    # prepare-ref-audio 실패는 전체 실패로 전파하지 않고 원본 ref_audio_file로 계속 진행한다(기존 UX 유지).
+    root = settings.SERVER_A_TRAIN_VOICE_ROOT
     
-    # ref_audio를 8초로 잘라서 ref_audio.wav 생성 (Server A에 요청)
-    files_api_url = settings.SERVER_A_FILES_API_URL.rstrip("/")
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            prepare_resp = await client.post(
-                f"{files_api_url}/api/files/prepare-ref-audio",
-                data={
-                    "train_input_dir": body.train_input_dir,
-                    "max_duration_sec": 10.0  # 10초로 제한
-                }
-            )
-            if prepare_resp.status_code == 200:
-                prepare_data = prepare_resp.json()
-                if prepare_data.get("success"):
-                    # 잘린 ref_audio.wav 사용
-                    ref_audio_file = prepare_data.get("ref_audio_file", body.ref_audio_file)
-                    import logging
-                    logging.info(f"ref_audio prepared: {prepare_data}")
-                else:
-                    ref_audio_file = body.ref_audio_file
-            else:
-                # 실패 시 원본 사용
-                ref_audio_file = body.ref_audio_file
-                import logging
-                logging.warning(f"prepare-ref-audio failed: {prepare_resp.text}")
-    except Exception as e:
-        # 실패해도 계속 진행 (원본 사용)
-        ref_audio_file = body.ref_audio_file
-        import logging
-        logging.warning(f"prepare-ref-audio error: {e}")
+    # 1) ref_audio를 10초 이하로 보정 시도 (실패 시 원본 사용)
+    ref_audio_file = await _resolve_ref_audio_file_with_prepare_fallback(
+        train_input_dir=body.train_input_dir,
+        original_ref_audio_file=body.ref_audio_file,
+    )
     
     ref_audio_path = f"{root.rstrip('/')}/{body.train_input_dir.lstrip('/')}/{ref_audio_file}"
 
     gpt_path = body.gpt_weights_path
     sovits_path = body.sovits_weights_path
     if gpt_path is None and sovits_path is None:
-        api_url = getattr(settings, "SERVER_A_FILES_API_URL", "").rstrip("/")
-        if api_url:
-            try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    r = await client.get(f"{api_url}/api/files/logs")
-                    if r.status_code == 200:
-                        data = r.json()
-                        for m in (data.get("models") or []):
-                            if (m.get("model_name") or "").strip() == (body.model_name or "").strip():
-                                gpt_path = m.get("gpt_path") or None
-                                sovits_path = m.get("sovits_path") or None
-                                break
-            except Exception:
-                pass
+        # 2) 가중치 경로를 명시하지 않은 경우 logs 인덱스에서 model_name으로 역추론한다.
+        # 실패해도 Voice 등록은 계속 진행한다(경로 없는 음성도 이후 관리자가 수동 보정 가능).
+        try:
+            r = await server_a_client.get_files_logs(timeout=5.0)
+            if r.status_code == 200:
+                data = r.json()
+                for m in (data.get("models") or []):
+                    if (m.get("model_name") or "").strip() == (body.model_name or "").strip():
+                        gpt_path = m.get("gpt_path") or None
+                        sovits_path = m.get("sovits_path") or None
+                        break
+        except Exception:
+            pass
 
     v = Voice(
         id=str(uuid.uuid4()),
@@ -411,6 +428,11 @@ async def delete_my_model_voice(
     내 모델 제작 음성 삭제.
     DB Voice 삭제, Character voice_id=NULL, Server A train_input_dir 폴더·logs/{training_model_name} 삭제.
     """
+    # [왜 여기서 처리하나]
+    # 사용자 자산 정리 경로라 DB/캐릭터 연결/Server A 파일 삭제를 같은 요청에서 묶어 "남은 찌꺼기"를 줄인다.
+    #
+    # [주의]
+    # Server A 삭제 실패(HTTPException)는 흡수하고 DB 삭제를 계속 진행한다. 1차 정책은 사용자 경험 일관성 우선이다.
     res = await db.execute(select(Voice).where(Voice.id == voice_id, Voice.user_id == current_user.id))
     v = res.scalar_one_or_none()
     if not v:
@@ -421,18 +443,20 @@ async def delete_my_model_voice(
 
     train_dir = getattr(v, "train_input_dir", None)
     model_name = getattr(v, "training_model_name", None)
-    root_train = getattr(settings, "SERVER_A_TRAIN_VOICE_ROOT", "/opt/GPT-SoVITS/sample_train_voice")
-    root_logs = getattr(settings, "SERVER_A_LOGS_ROOT", "/opt/GPT-SoVITS/logs")
-    api_url = settings.SERVER_A_FILES_API_URL.rstrip("/")
-    del_url = f"{api_url}/api/files"
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        if train_dir:
-            path = f"{root_train.rstrip('/')}/{train_dir.lstrip('/')}"
-            await client.delete(del_url, params={"path": path})
-        if model_name:
-            path = f"{root_logs.rstrip('/')}/{model_name}"
-            await client.delete(del_url, params={"path": path})
+    root_train = settings.SERVER_A_TRAIN_VOICE_ROOT
+    root_logs = settings.SERVER_A_LOGS_ROOT
+    if train_dir:
+        path = f"{root_train.rstrip('/')}/{train_dir.lstrip('/')}"
+        try:
+            await server_a_client.delete_file(path=path, timeout=15.0)
+        except HTTPException:
+            pass
+    if model_name:
+        path = f"{root_logs.rstrip('/')}/{model_name}"
+        try:
+            await server_a_client.delete_file(path=path, timeout=15.0)
+        except HTTPException:
+            pass
 
     await db.delete(v)
     await db.commit()

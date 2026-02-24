@@ -2,12 +2,14 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from app.core.llm import call_llm
 import json
+import logging
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_db, get_current_user
 from app.models.user import User
 from app.models.scenario import Scenario
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 class StoryGenerationRequest(BaseModel):
     user_name: str
@@ -21,12 +23,19 @@ async def generate_story(
     current_user: User = Depends(get_current_user) # 사용자 정보 주입
 ):
     """
-    [기능] 
-    1. 상황 키워드를 바탕으로 'UI 표시용 1줄 요약' 생성
-    2. AI가 연기할 '구체적인 상황 배경' 생성
-    3. 생성된 시나리오를 DB에 저장
+    [역할]
+    상황 키워드를 바탕으로 UI 요약(summary)과 캐릭터용 배경(background)을 생성하고 시나리오를 저장한다.
+
+    [왜 여기서 처리하나]
+    이 엔드포인트는 "스토리 생성 LLM 호출 + Scenario 영속화"의 경계라서,
+    1차 리팩토링에서는 응답 shape를 유지한 채 라우터에서 오케스트레이션만 명확히 둔다.
+
+    [주의]
+    실패 시에도 `success=True` fallback 응답을 반환하는 현재 UX 계약을 유지한다.
+    (생성 품질 저하와 API 실패를 분리해서 보이게 하는 정책)
     """
-    
+
+    # 1) 스토리 생성 프롬프트 구성 (JSON 출력 강제)
     system_prompt = f"""
     당신은 드라마 시나리오 작가입니다. 
     사용자가 입력한 [상황 키워드]를 바탕으로 두 가지를 출력하세요.
@@ -50,10 +59,11 @@ async def generate_story(
     }}
     """
 
+    # 2) LLM 호출용 메시지 구성
     messages = [{"role": "system", "content": system_prompt}]
 
     try:
-        # JSON 모드로 응답 받기 (프롬프트로 강제)
+        # 3) LLM 호출 + JSON 파싱
         result = await call_llm(messages, temperature=0.7)
         
         content = result if isinstance(result, str) else result.get("content", "")
@@ -68,7 +78,7 @@ async def generate_story(
         summary_text = data.get("summary", request.situation)
         background_text = data.get("background", request.situation)
 
-        # DB 저장
+        # 4) Scenario DB 저장
         new_scenario = Scenario(
             user_id=current_user.id,
             user_name=request.user_name,
@@ -91,7 +101,9 @@ async def generate_story(
         }
 
     except Exception as e:
-        print(f"Story Gen Error: {e}")
+        # broad except 유지 이유:
+        # LLM 호출/JSON 파싱/DB 저장 중 어디서 실패하든 현재 계약은 "fallback 스토리 반환"이기 때문이다.
+        logger.warning("Story generation endpoint fallback used: %s", e)
         # 실패 시에도 기본값으로라도 저장 시도? 아니면 저장 안함.
         # 에러 발생 시 저장을 못하므로 그냥 리턴
         return {

@@ -15,6 +15,10 @@ class Voice(Base):
     
     각 음성은 GPT-SoVITS에서 TTS 생성 시 사용되는 
     참조 오디오(ref_audio) 정보를 포함합니다.
+
+    [주의]
+    - `ref_audio_path`, weights 경로는 Server A 기준 경로 문자열이며 백엔드 로컬 경로와 다를 수 있다.
+    - `train_input_dir`/`training_model_name`은 model-make 정리/삭제 흐름과 연결되어 있어 의미 변경에 주의.
     """
     __tablename__ = "voices"
 

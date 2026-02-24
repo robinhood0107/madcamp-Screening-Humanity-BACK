@@ -43,11 +43,23 @@
 *   **Authentication:** OAuth2 (Google), JWT
 *   **ETC:** HTTPX (Async Client), Pydantic
 
+## 🔐 Gemini 키 운영 정책
+
+*   Gemini 비밀키는 **Backend `.env`에서만** 관리합니다.
+*   권장 키: `GEMINI_API_KEY`
+*   Gemini 기본 모델: `GOOGLE_API_MODEL` (예: `gemini-2.5-flash`, `gemini-2.5-pro`)
+*   레거시 별칭(선택): `GOOGLE_API_KEY`
+*   금지: `NEXT_PUBLIC_GEMINI_API_KEY` (FRONT 공개 env, 사용 금지/폐기)
+*   Gemini Safety 필터 강도 조절: `GOOGLE_SAFETY_THRESHOLD` (`BLOCK_NONE`, `BLOCK_ONLY_HIGH`, `BLOCK_MEDIUM_AND_ABOVE`, `BLOCK_LOW_AND_ABOVE`, `HARM_BLOCK_THRESHOLD_UNSPECIFIED`)
+*   관련 설정 문서: `env 설정법.md`
+
 ## ✨ 주요 기능 (Features)
 
 *   **사용자 인증 (Auth)**
     *   Google OAuth 소셜 로그인
+    *   Guest 로그인 (백엔드 guest 세션 + HttpOnly guest 쿠키)
     *   JWT 액세스 토큰 발급 및 관리
+    *   인증 감사 로그(`auth_events`) / guest 세션 기록(`guest_sessions`)
     *   개발 편의를 위한 `dev-user` 자동 로그인 지원
 *   **캐릭터 관리 (Character)**
     *   나만의 페르소나 캐릭터 생성 (이미지, 성격, 말투 등)
@@ -72,5 +84,26 @@ app/
 └── workers/        # 백그라운드 워커 (현재 비활성화됨)
 docs/               # 프로젝트 문서
 ```
+
+## ⚙️ 환경변수 안내
+
+*   Backend env 템플릿: `.env.example`
+*   자세한 설명: `env 설정법.md`
+*   루트 Docker Compose 사용 시 일부 URL은 루트 `docker-compose*.yaml`에서 override될 수 있습니다.
+
+### 1차 보안 가시화 플래그 (기본값은 기존 동작 유지)
+
+*   `DEV_AUTH_FALLBACK_ENABLED` : 개발용 `dev-user` 인증 폴백 허용 여부 (운영은 `false` 권장)
+*   `GOOGLE_SSO_ALLOW_INSECURE_HTTP` : 로컬 HTTP OAuth 테스트 허용 여부 (운영 HTTPS는 `false` 권장)
+*   `AUTH_COOKIE_SECURE` / `AUTH_COOKIE_SAMESITE` : 인증 쿠키 보안 속성
+*   `STARTUP_SCHEMA_PATCH_ENABLED` : startup ad-hoc DB 패치 실행 여부 (레거시 호환용)
+*   `APP_ENV` + `STRICT_STARTUP_VALIDATION` : 운영 모드에서 위험 설정 조합 fail-fast 검증
+*   `GUEST_AUTH_ENABLED`, `GUEST_AUTH_COOKIE_NAME`, `GUEST_ACCESS_TOKEN_EXPIRE_MINUTES`, `GUEST_COOKIE_SESSION_ONLY` : guest 인증 정책 제어
+
+### Docker GPT-SoVITS 데이터 볼륨 정책 (루트 compose)
+
+*   루트 `docker-compose.yaml`에서 GPT-SoVITS 관련 볼륨은 Docker named volume 대신 Windows bind mount로 연결됩니다.
+*   기본 경로: `D:/docker/madcamp03/gpt-sovits/*`
+*   루트 `.env`에서 `DOCKER_DATA_ROOT`로 override 가능 (예: `DOCKER_DATA_ROOT=D:/docker/madcamp03`)
 
 

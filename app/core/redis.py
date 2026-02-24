@@ -1,9 +1,11 @@
 import redis.asyncio as redis
 from typing import Optional
+import logging
 from app.core.config import settings
 
 # 전역 Redis 클라이언트 인스턴스
 redis_client: Optional[redis.Redis] = None
+logger = logging.getLogger(__name__)
 
 async def init_redis_pool():
     """애플리케이션 시작 시 Redis 연결 풀 초기화"""
@@ -17,16 +19,16 @@ async def init_redis_pool():
     # 연결 테스트
     try:
         await redis_client.ping()
-        print(f"Redis connected: {settings.REDIS_URL}")
+        logger.info("Redis connected: %s", settings.REDIS_URL)
     except Exception as e:
-        print(f"Redis connection failed: {e}")
+        logger.warning("Redis connection failed: %s", e)
 
 async def close_redis_pool():
     """애플리케이션 종료 시 Redis 연결 해제"""
     global redis_client
     if redis_client:
         await redis_client.close()
-        print("Redis connection closed")
+        logger.info("Redis connection closed")
 
 def get_redis_client() -> redis.Redis:
     """Redis 클라이언트 반환"""

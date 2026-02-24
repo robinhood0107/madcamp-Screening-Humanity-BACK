@@ -1,0 +1,27 @@
+.git
+.github
+.gitignore
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+.venv/
+venv/
+
+.env
+.env.*
+!.env.example
+
+*.db
+avatar_forge.db
+
+uploads/
+
+scripts/
+test_ollama_connection.py
+
+백엔드_리팩토링_정밀_분석_명세서.md
+env 설정법.md
+

@@ -9,13 +9,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 import uuid
 import logging
-import httpx
 from pathlib import Path
 
 from app.api.deps import get_db, get_current_user, require_admin
 from app.models.voice import Voice
 from app.models.user import User
 from app.core.config import settings
+from app.services import server_a_client
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -121,28 +121,30 @@ async def get_server_files(
     Server A의 파일 스캔 API를 호출하여 모델, 훈련 음성, 참조 오디오 목록을 반환합니다.
     URL: /api/files/all
     """
+    # [왜 여기서 처리하나]
+    # 관리자 파일 매니저는 "현재 파일 트리 전체"를 한 번에 받아야 UI 초기 렌더가 단순해진다.
+    # 다만 Server A 버전별로 통합 인덱스 API 지원 여부가 달라서 라우터에서 호환 폴백을 유지한다.
+    #
+    # [주의]
+    # 반환 키(models/train_voices/logs)는 프론트 파일 패널 파서와 직접 연결되어 있어 변경하면 안 된다.
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            api_url = settings.SERVER_A_FILES_API_URL.rstrip("/")
-            response = await client.get(f"{api_url}/api/files/all")
-            
-            if response.status_code == 200:
-                return response.json()
-            
-            # API가 통합 엔드포인트를 지원하지 않는 경우 개별 조회 (models, train_voices, logs)
-            models_res = await client.get(f"{api_url}/api/files/models")
-            train_voices_res = await client.get(f"{api_url}/api/files/train-voices")
-            logs_res = await client.get(f"{api_url}/api/files/logs")
-            return {
-                "models": models_res.json() if models_res.status_code == 200 else {},
-                "train_voices": train_voices_res.json() if train_voices_res.status_code == 200 else {},
-                "logs": logs_res.json() if logs_res.status_code == 200 else {"models": []}
-            }
-            
-    except httpx.RequestError as e:
+        response = await server_a_client.get_files_index(timeout=10.0)
+        if response.status_code == 200:
+            return response.json()
+
+        # API가 통합 엔드포인트를 지원하지 않는 경우 개별 조회 (models, train_voices, logs)
+        models_res = await server_a_client.get_files_models(timeout=10.0)
+        train_voices_res = await server_a_client.get_files_train_voices(timeout=10.0)
+        logs_res = await server_a_client.get_files_logs(timeout=10.0)
+        return {
+            "models": models_res.json() if models_res.status_code == 200 else {},
+            "train_voices": train_voices_res.json() if train_voices_res.status_code == 200 else {},
+            "logs": logs_res.json() if logs_res.status_code == 200 else {"models": []}
+        }
+    except HTTPException as e:
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Server A 파일 API({settings.SERVER_A_FILES_API_URL})에 연결할 수 없습니다: {str(e)}"
+            status_code=e.status_code,
+            detail=f"Server A 파일 API({settings.SERVER_A_FILES_API_URL})에 연결할 수 없습니다: {e.detail}"
         )
 
 
@@ -157,74 +159,72 @@ async def process_ref_audio(path: str, train_input_dir: Optional[str] = None) ->
     - 10초 초과: 자동 트리밍 시도 (prepare-ref-audio 호출) -> 성공 시 변경된 경로 반환
     - 3초 미만: 에러 발생
     """
-    api_url = settings.SERVER_A_FILES_API_URL.rstrip("/")
-    
+    # [왜 여기서 처리하나]
+    # create/update/test 경로가 모두 같은 길이 정책을 공유하므로 라우터 밖 helper로 모아 정책 드리프트를 막는다.
+    #
+    # [주의]
+    # 반환값은 "Server A 내부 경로"이다. 로컬 경로처럼 열거나 stat 하면 안 된다.
     # 1. 검증 요청
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(f"{api_url}/api/files/validate-ref-audio", data={"path": path})
-            if resp.status_code != 200:
-                 raise HTTPException(status_code=400, detail=f"Audio validation API failed: {resp.text}")
-            
-            data = resp.json()
-            is_valid = data.get("valid")
-            duration = data.get("duration_sec", 0.0)
-            
-            if is_valid:
-                return path
+        resp = await server_a_client.validate_ref_audio(path=path, timeout=10.0)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=400, detail=f"Audio validation API failed: {resp.text}")
 
-            # 2. 유효하지 않은 경우 처리
-            # 3초 미만
-            if duration < 3.0:
-                raise HTTPException(
-                    status_code=400, 
-                    detail=f"참조 오디오가 너무 짧습니다 ({duration}s). 최소 3초 이상이어야 합니다."
-                )
-            
-            # 10초 초과 -> 자동 트리밍
-            if duration > 10.0:
-                if not train_input_dir:
-                    # train_input_dir 없을 경우 경로에서 추론 시도
-                    try:
-                        p = Path(path)
-                        if "sample_train_voice" in path:
-                             train_input_dir = p.parent.name
-                        else:
-                             raise ValueError("Cannot infer train_input_dir")
-                    except:
-                        raise HTTPException(status_code=400, detail="오디오가 10초를 초과하여 자르기가 필요하지만 train_input_dir 정보가 부족합니다.")
-                
-                # 자르기 요청
-                ref_file_name = Path(path).name
-                prepare_resp = await client.post(
-                    f"{api_url}/api/files/prepare-ref-audio",
-                    data={
-                        "sub_path": train_input_dir,
-                        "ref_file": ref_file_name,
-                        "max_duration_sec": 10.0
-                    },
-                    timeout=30.0
-                )
-                
-                if prepare_resp.status_code == 200:
-                    prep_data = prepare_resp.json()
-                    if prep_data.get("success"):
-                        # 성공: 새 파일명으로 경로 구성
-                        new_filename = prep_data.get("ref_audio_file")
-                        parent_dir = str(Path(path).parent)
-                        return f"{parent_dir}/{new_filename}".replace("\\", "/")
+        data = resp.json()
+        is_valid = data.get("valid")
+        duration = data.get("duration_sec", 0.0)
+
+        if is_valid:
+            return path
+
+        # 2. 유효하지 않은 경우 처리
+        if duration < 3.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"참조 오디오가 너무 짧습니다 ({duration}s). 최소 3초 이상이어야 합니다."
+            )
+
+        # 10초 초과 -> 자동 트리밍
+        if duration > 10.0:
+            if not train_input_dir:
+                # train_input_dir 없을 경우 경로에서 추론 시도
+                try:
+                    p = Path(path)
+                    if "sample_train_voice" in path:
+                        train_input_dir = p.parent.name
                     else:
-                        raise HTTPException(status_code=400, detail=f"Auto-trimming failed: {prep_data.get('message')}")
-                else:
-                    raise HTTPException(status_code=400, detail="Auto-trimming API request failed.")
+                        raise ValueError("Cannot infer train_input_dir")
+                except Exception:
+                    raise HTTPException(status_code=400, detail="오디오가 10초를 초과하여 자르기가 필요하지만 train_input_dir 정보가 부족합니다.")
 
-            # 그 외
-            raise HTTPException(status_code=400, detail=f"Audio validation failed: {data.get('message')}")
-            
-    except httpx.RequestError as e:
+            ref_file_name = Path(path).name
+            prepare_resp = await server_a_client.prepare_ref_audio(
+                data={
+                    "sub_path": train_input_dir,
+                    "ref_file": ref_file_name,
+                    "max_duration_sec": 10.0,
+                },
+                timeout=30.0,
+            )
+
+            if prepare_resp.status_code == 200:
+                prep_data = prepare_resp.json()
+                if prep_data.get("success"):
+                    new_filename = prep_data.get("ref_audio_file")
+                    parent_dir = str(Path(path).parent)
+                    return f"{parent_dir}/{new_filename}".replace("\\", "/")
+                raise HTTPException(status_code=400, detail=f"Auto-trimming failed: {prep_data.get('message')}")
+
+            raise HTTPException(status_code=400, detail="Auto-trimming API request failed.")
+
+        raise HTTPException(status_code=400, detail=f"Audio validation failed: {data.get('message')}")
+
+    except HTTPException as e:
+        if e.status_code in {400}:
+            raise
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Server A connection failed: {str(e)}"
+            detail=f"Server A connection failed: {e.detail if isinstance(e.detail, str) else str(e.detail)}"
         )
 
 
@@ -238,6 +238,11 @@ async def upload_train_voice_file(
     훈련 데이터(train_voice) 전용 업로드. 오디오(.wav, .mp3, .flac, .ogg)만 허용.
     Server A /api/files/upload로 category=train_voice, sub_path 전달.
     """
+    # [왜 여기서 처리하나]
+    # 확장자 검증은 네트워크 요청 전에 빠르게 끊어서 관리자 파일 매니저 UX(즉시 오류 표시)를 지킨다.
+    #
+    # [실패/예외]
+    # HTTPException은 기존 상세 메시지를 그대로 유지하고, 비정형 예외만 500으로 감싼다.
     if not file.filename:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="파일명이 없습니다")
     ext = "." + file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
@@ -246,21 +251,16 @@ async def upload_train_voice_file(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"오디오 파일만 허용됩니다: {', '.join(_ALLOWED_AUDIO_EXT)}"
         )
-    api_url = settings.SERVER_A_FILES_API_URL.rstrip("/")
-    upload_url = f"{api_url}/api/files/upload"
     try:
-        files = {"file": (file.filename, file.file, file.content_type or "application/octet-stream")}
-        data = {"category": "train_voice", "sub_path": sub_path}
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            response = await client.post(upload_url, data=data, files=files)
-            if response.status_code != 200:
-                raise HTTPException(status_code=response.status_code, detail=f"Upload Failed: {response.text}")
-            return response.json()
-    except httpx.RequestError as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Server A 연결 실패: {str(e)}"
+        response = await server_a_client.upload_train_voice_file(
+            file_tuple=(file.filename, file.file, file.content_type or "application/octet-stream"),
+            sub_path=sub_path,
+            timeout=300.0,
         )
+        server_a_client.ensure_success_response(response, error_prefix="Upload Failed")
+        return response.json()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"업로드 오류: {str(e)}")
 
@@ -271,26 +271,12 @@ async def delete_server_file(
     current_user: User = Depends(require_admin)
 ):
     """Server A 파일/폴더 삭제 (관리자 전용)"""
-    api_url = settings.SERVER_A_FILES_API_URL.rstrip("/")
-    delete_url = f"{api_url}/api/files"
-    
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.delete(delete_url, params={"path": path})
-            
-            if response.status_code != 200:
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail=f"Delete Failed: {response.text}"
-                )
-            
-            return response.json()
-            
-    except httpx.RequestError as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Server A 연결 실패: {str(e)}"
-        )
+        response = await server_a_client.delete_file(path=path, timeout=10.0)
+        server_a_client.ensure_success_response(response, error_prefix="Delete Failed")
+        return response.json()
+    except HTTPException:
+        raise
 
 
 @router.post("/voices/server-files/mkdir")
@@ -299,28 +285,12 @@ async def create_server_folder(
     current_user: User = Depends(require_admin)
 ):
     """Server A 훈련 음성 폴더 생성 (관리자 전용)"""
-    api_url = settings.SERVER_A_FILES_API_URL.rstrip("/")
-    mkdir_url = f"{api_url}/api/files/mkdir"
-    
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(mkdir_url, data={"path": path})
-            
-            if response.status_code != 200:
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail=f"Mkdir Failed: {response.text}"
-                )
-            
-            return response.json()
-            
-            return response.json()
-            
-    except httpx.RequestError as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Server A 연결 실패: {str(e)}"
-        )
+        response = await server_a_client.mkdir(path=path, timeout=10.0)
+        server_a_client.ensure_success_response(response, error_prefix="Mkdir Failed")
+        return response.json()
+    except HTTPException:
+        raise
 
 
 @router.post("/voices/server-files/trim")
@@ -330,33 +300,17 @@ async def trim_server_audio(
     current_user: User = Depends(require_admin)
 ):
     """Server A 오디오 자르기 (관리자 전용)"""
-    api_url = settings.SERVER_A_FILES_API_URL.rstrip("/")
-    trim_url = f"{api_url}/api/files/trim-audio"
-    
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                trim_url, 
-                data={
-                    "source_path": path,
-                    "max_duration_sec": max_duration_sec,
-                    "output_suffix": "_trimmed"
-                }
-            )
-            
-            if response.status_code != 200:
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail=f"Trim Failed: {response.text}"
-                )
-            
-            return response.json()
-            
-    except httpx.RequestError as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Server A 연결 실패: {str(e)}"
+        response = await server_a_client.trim_audio(
+            source_path=path,
+            max_duration_sec=max_duration_sec,
+            output_suffix="_trimmed",
+            timeout=30.0,
         )
+        server_a_client.ensure_success_response(response, error_prefix="Trim Failed")
+        return response.json()
+    except HTTPException:
+        raise
 
 
 # ============ 사용자 API (get_current_user, /voices/{id} 보다 먼저 정의) ============
@@ -483,6 +437,11 @@ async def create_voice(
     - ref_audio_path: Server A 내부의 참조 오디오 파일 경로
     - is_default=True로 설정 시 기존 기본 음성은 자동으로 False로 변경
     """
+    # [왜 여기서 처리하나]
+    # Voice DB 등록 직전에 ref_audio 정책(길이 검증/자동 트리밍)을 강제해, 이후 TTS 경로의 실패를 앞단에서 줄인다.
+    #
+    # [주의]
+    # 기본 음성 교체 규칙(is_default 전환)은 관리자 UI 전제라 유지해야 한다.
     # is_default가 True면 기존 기본 음성 해제
     if request.is_default:
         await db.execute(
@@ -548,6 +507,11 @@ async def update_voice(
     current_user: User = Depends(require_admin)
 ):
     """음성 정보 수정 (관리자 전용)"""
+    # [왜 여기서 처리하나]
+    # update는 "부분 수정"이 핵심이므로 ref_audio_path만 조건부 재검증하고 나머지는 model_dump 결과를 그대로 반영한다.
+    #
+    # [주의]
+    # ref_audio_path 변경 시 train_input_dir 추론 로직이 개입하므로 단순 setattr로 바꾸면 Server A 경로 정책이 깨질 수 있다.
     result = await db.execute(
         select(Voice).where(Voice.id == voice_id)
     )
@@ -653,6 +617,11 @@ async def test_voice(
     
     지정된 음성으로 테스트 텍스트를 TTS 변환하여 base64 오디오 반환
     """
+    # [왜 여기서 처리하나]
+    # /tts 라우터를 재사용하지 않고 여기서 직접 payload를 만드는 이유는 관리자 미리듣기 UX가 base64 응답을 바로 기대하기 때문이다.
+    #
+    # [주의]
+    # success/data/audio_base64/format/... 키는 프론트 미리듣기 파서와 연결되어 있어 shape 변경 금지.
     # 음성 조회
     result = await db.execute(
         select(Voice).where(Voice.id == voice_id, Voice.is_active == True)
@@ -666,10 +635,6 @@ async def test_voice(
         )
     
     # GPT-SoVITS API 호출
-    tts_base_url = settings.TTS_BASE_URL.rstrip("/")
-    tts_api_path = settings.TTS_API_PATH.lstrip("/")
-    tts_url = f"{tts_base_url}/{tts_api_path}"
-    
     tts_request = {
         "text": request.text,
         "text_lang": voice.language,
@@ -686,47 +651,23 @@ async def test_voice(
     if voice.sovits_weights_path:
         tts_request["sovits_weights"] = voice.sovits_weights_path
     
-    try:
-        async with httpx.AsyncClient(verify=settings.TTS_SSL_VERIFY, timeout=settings.TTS_TIMEOUT) as client:
-            response = await client.post(tts_url, json=tts_request)
-            response.raise_for_status()
-            audio_content = response.content
-        
-        # Base64로 인코딩하여 반환
-        import base64
-        audio_base64 = base64.b64encode(audio_content).decode("utf-8")
-        
-        return {
-            "success": True,
-            "data": {
-                "audio_base64": audio_base64,
-                "format": "wav",
-                "voice_id": voice.id,
-                "voice_name": voice.name,
-                "text": request.text
-            }
+    response = await server_a_client.call_tts(json_body=tts_request, timeout=settings.TTS_TIMEOUT)
+    server_a_client.ensure_success_response(response, error_prefix="TTS 서비스 오류")
+    audio_content = response.content
+
+    import base64
+    audio_base64 = base64.b64encode(audio_content).decode("utf-8")
+
+    return {
+        "success": True,
+        "data": {
+            "audio_base64": audio_base64,
+            "format": "wav",
+            "voice_id": voice.id,
+            "voice_name": voice.name,
+            "text": request.text
         }
-        
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(
-            status_code=e.response.status_code,
-            detail=f"TTS 서비스 오류: {e.response.status_code}"
-        )
-    except httpx.TimeoutException:
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="TTS 서비스 응답 시간 초과"
-        )
-    except httpx.ConnectError:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"TTS 서비스 연결 실패: {tts_url}"
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"TTS 테스트 오류: {str(e)}"
-        )
+    }
 
 
 # ============ 학습 API (Server A Proxy) ============
@@ -754,26 +695,11 @@ async def start_training_proxy(
     
     Server A의 /api/train/start 엔드포인트를 호출합니다.
     """
-    api_url = settings.SERVER_A_TRAINING_API_URL.rstrip("/") if hasattr(settings, "SERVER_A_TRAINING_API_URL") else "http://localhost:10002"
-    target_url = f"{api_url}/api/train/start"
-    
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(target_url, json=request.dict())
-            
-            if response.status_code != 200:
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail=f"Training Start Failed: {response.text}"
-                )
-            
-            return response.json()
-            
-    except httpx.RequestError as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Server A 학습 API 연결 실패: {str(e)}"
-        )
+    # [왜 여기서 처리하나]
+    # 이 경로는 "관리자 학습 프록시" 역할만 수행한다. 세부 학습 정책/파라미터 검증은 Server A가 담당한다.
+    response = await server_a_client.start_training(payload=request.dict(), timeout=10.0)
+    server_a_client.ensure_success_response(response, error_prefix="Training Start Failed")
+    return response.json()
 
 
 @router.get("/voices/train/status/{model_name}")
@@ -786,29 +712,15 @@ async def get_training_status_proxy(
     
     Server A의 /api/train/status/{model_name} 호출
     """
-    api_url = settings.SERVER_A_TRAINING_API_URL.rstrip("/") if hasattr(settings, "SERVER_A_TRAINING_API_URL") else "http://localhost:10002"
-    target_url = f"{api_url}/api/train/status/{model_name}"
-    
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(target_url)
-            
-            if response.status_code == 404:
-                raise HTTPException(status_code=404, detail="Training status not found")
-            
-            if response.status_code != 200:
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail=f"Status Check Failed: {response.text}"
-                )
-            
-            return response.json()
-            
-    except httpx.RequestError as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Server A 학습 API 연결 실패: {str(e)}"
-        )
+    # [주의]
+    # 404는 polling 중 흔한 상태라 완전 실패로 취급하지 않고 allow_404_detail로 메시지만 고정한다.
+    response = await server_a_client.get_training_status(model_name=model_name, timeout=5.0)
+    server_a_client.ensure_success_response(
+        response,
+        error_prefix="Status Check Failed",
+        allow_404_detail="Training status not found",
+    )
+    return response.json()
 
 
 @router.get("/voices/train/log/{model_name}")
@@ -821,26 +733,12 @@ async def get_training_log_proxy(
     
     Server A의 /api/train/log/{model_name} 호출
     """
-    api_url = settings.SERVER_A_TRAINING_API_URL.rstrip("/") if hasattr(settings, "SERVER_A_TRAINING_API_URL") else "http://localhost:10002"
-    target_url = f"{api_url}/api/train/log/{model_name}"
-    
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(target_url)
-            
-            if response.status_code == 404:
-                raise HTTPException(status_code=404, detail="Log not found")
-            
-            if response.status_code != 200:
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail=f"Log Retrieval Failed: {response.text}"
-                )
-            
-            return response.json()
-            
-    except httpx.RequestError as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Server A 학습 API 연결 실패: {str(e)}"
-        )
+    # [주의]
+    # 로그 파일 미생성/정리 직후 404는 정상 시나리오일 수 있으므로 allow_404_detail 정책을 유지한다.
+    response = await server_a_client.get_training_log(model_name=model_name, timeout=5.0)
+    server_a_client.ensure_success_response(
+        response,
+        error_prefix="Log Retrieval Failed",
+        allow_404_detail="Log not found",
+    )
+    return response.json()

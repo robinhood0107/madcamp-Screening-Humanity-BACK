@@ -1,3 +1,12 @@
+"""
+[역할]
+비동기 생성 작업(3D/style/tts 등)의 상태 추적용 테이블 모델.
+
+[주의]
+- `input_payload`는 현재 JSON 문자열/경로 문자열 등 혼합 저장이 가능해 타입 정규화가 완전하지 않다.
+- 1차 리팩토링에서는 스키마 변경 없이 라우터/서비스에서 해석 규칙을 유지한다.
+"""
+
 from sqlalchemy import Column, String, DateTime, ForeignKey, Text, Float, Integer, Boolean
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
@@ -5,6 +14,7 @@ import uuid
 from app.core.database import Base
 
 class GenerationJob(Base):
+    """생성 작업 상태/결과 메타데이터."""
     __tablename__ = "generation_jobs"
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))

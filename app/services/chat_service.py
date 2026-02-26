@@ -308,7 +308,7 @@ async def persist_chat_turn_messages(
     raw_request_messages: List[Any],
     assistant_content: str,
     speaker_name: Optional[str],
-) -> None:
+) -> Dict[str, Optional[str]]:
     """
     [역할]
     채팅 한 턴의 사용자 메시지(마지막 user/human)와 AI 응답을 DB에 저장하고 commit한다.
@@ -333,26 +333,29 @@ async def persist_chat_turn_messages(
       - AI 메시지는 항상 `role='assistant'`
       - user 메시지에 `character_name`은 저장하지 않음
     """
+    user_row: Optional[ChatMessage] = None
     if raw_request_messages and getattr(raw_request_messages[-1], "role", None) in ["user", "human"]:
         last_msg = raw_request_messages[-1]
-        db.add(
-            ChatMessage(
-                session_id=session_id,
-                role="user",
-                content=getattr(last_msg, "content", ""),
-            )
-        )
-
-    db.add(
-        ChatMessage(
+        user_row = ChatMessage(
             session_id=session_id,
-            role="assistant",
-            content=assistant_content,
-            character_name=speaker_name,
+            role="user",
+            content=getattr(last_msg, "content", ""),
         )
+        db.add(user_row)
+
+    assistant_row = ChatMessage(
+        session_id=session_id,
+        role="assistant",
+        content=assistant_content,
+        character_name=speaker_name,
     )
+    db.add(assistant_row)
 
     await db.commit()
+    return {
+        "user_message_id": user_row.id if user_row else None,
+        "assistant_message_id": assistant_row.id,
+    }
 
 
 async def synthesize_chat_tts_audio_url(
@@ -376,10 +379,39 @@ async def synthesize_chat_tts_audio_url(
     - `app.api.tts` import는 순환 의존/초기화 순서 리스크를 줄이기 위해 함수 내부에서 lazy import 한다.
     - 실패/예외 정책(HTTPException/ValueError 매핑)은 `_synthesize_tts_internal`이 그대로 담당한다.
     """
+    tts_data = await synthesize_chat_tts_result(
+        text=text,
+        voice_id=voice_id,
+        streaming_mode=streaming_mode,
+        speed_factor=speed_factor,
+        current_user=current_user,
+        db=db,
+    )
+    if tts_data and tts_data.get("audio_url"):
+        return str(tts_data["audio_url"])
+    return None
+
+
+async def synthesize_chat_tts_result(
+    *,
+    text: str,
+    voice_id: Optional[str],
+    streaming_mode: int,
+    speed_factor: float,
+    current_user: Any,
+    db: AsyncSession,
+) -> Optional[Dict[str, Any]]:
+    """
+    [역할]
+    `/chat`용 TTS 합성을 수행하고 성공 시 내부 data payload를 반환한다.
+
+    [왜 추가했나]
+    - history 오디오 링크 저장을 위해 `audio_url` 외에 `file_id`, `duration` 같은 메타가 필요하다.
+    - 기존 `synthesize_chat_tts_audio_url`는 호환용 wrapper로 유지한다.
+    """
     if not (text or "").strip():
         return None
 
-    # Lazy import: chat router와 TTS router 간 import 결합을 최소화한다.
     from app.api.tts import TTSRequest, _synthesize_tts_internal
 
     tts_req = TTSRequest(
@@ -392,6 +424,6 @@ async def synthesize_chat_tts_audio_url(
         speed_factor=speed_factor,
     )
     tts_resp = await _synthesize_tts_internal(tts_req, current_user, db)
-    if tts_resp.get("success") and tts_resp.get("data", {}).get("audio_url"):
-        return tts_resp["data"]["audio_url"]
+    if tts_resp.get("success") and isinstance(tts_resp.get("data"), dict):
+        return tts_resp["data"]
     return None

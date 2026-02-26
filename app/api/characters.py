@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import logging
@@ -7,9 +8,13 @@ from sqlalchemy import select, delete
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.deps import get_db, get_current_user, require_admin
+from app.models.character_catalog import CharacterCatalog
 from app.models.user import User
 from app.models.character import Character
 from app.services import character_service
+from app.services import character_catalog_service
+from app.services import character_catalog_image_service
+from app.services import character_catalog_data_gateway
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -195,9 +200,27 @@ class AdminCharacterVoiceUpdate(BaseModel):
 # - preset 조회, dev-user 기반 CRUD처럼 운영 인증 없이 접근 가능한(또는 개발 편의 목적의) 경로를 모아둔다.
 # - 운영 환경에서는 비활성화 후보가 될 수 있으므로 사용자 인증 라우트와 섞이지 않게 섹션으로 구분한다.
 @router.get("/characters/presets")
-async def list_preset_characters():
+async def list_preset_characters(db: AsyncSession = Depends(get_db)):
     """사전설정 캐릭터 목록 조회"""
     try:
+        # [Phase E 브리지]
+        # DB 캐릭터 카탈로그가 준비되어 있으면 preset/public 항목을 우선 사용한다.
+        # 빈 결과 또는 브리지 실패 시 레거시 파일 로더로 안전 fallback 한다.
+        try:
+            db_preset_chars = await character_catalog_data_gateway.list_public_preset_items_as_legacy_payload(
+                db=db,
+                limit=500,
+            )
+            if db_preset_chars:
+                return {
+                    "success": True,
+                    "data": {
+                        "characters": db_preset_chars
+                    }
+                }
+        except SQLAlchemyError as e:
+            logger.warning("DB character catalog preset source unavailable, fallback to file presets: %s", e)
+
         preset_chars = load_preset_characters()
         return {
             "success": True,
@@ -213,6 +236,46 @@ async def list_preset_characters():
             e,
             log_context="Preset character list failed (typed residual error)",
         )
+
+
+@router.get("/characters/catalog-image/{catalog_id}")
+async def get_character_catalog_image(
+    catalog_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    DB 원본 캐릭터 카탈로그 이미지 서빙 엔드포인트.
+
+    우선순위:
+    1. media_assets(blob/volume)
+    2. legacy/external image_url_external redirect (self-loop 방지)
+    """
+    item: CharacterCatalog | None = await character_catalog_service.get_catalog_item_or_none(db=db, catalog_id=catalog_id)
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="캐릭터 카탈로그 항목을 찾을 수 없습니다")
+
+    payload = await character_catalog_image_service.load_catalog_image_payload(db=db, catalog=item)
+    if payload:
+        media_type = payload.get("mime_type") or "application/octet-stream"
+        if payload.get("blob_data") is not None:
+            return Response(
+                content=payload["blob_data"],
+                media_type=media_type,
+                headers={"Cache-Control": "public, max-age=3600"},
+            )
+        file_path = payload.get("file_path")
+        if file_path:
+            return FileResponse(
+                path=file_path,
+                media_type=media_type,
+                headers={"Cache-Control": "public, max-age=3600"},
+            )
+
+    canonical = character_catalog_image_service.catalog_image_public_url(item.id)
+    if item.image_url_external and item.image_url_external != canonical:
+        return RedirectResponse(url=item.image_url_external, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="캐릭터 이미지를 찾을 수 없습니다")
 
 @router.get("/characters")
 async def list_user_characters(

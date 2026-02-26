@@ -6,7 +6,7 @@ import logging
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_db, get_current_user
 from app.models.user import User
-from app.models.scenario import Scenario
+from app.services import scenario_data_gateway
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -78,25 +78,23 @@ async def generate_story(
         summary_text = data.get("summary", request.situation)
         background_text = data.get("background", request.situation)
 
-        # 4) Scenario DB 저장
-        new_scenario = Scenario(
+        # 4) Scenario 저장 (data-service rehearsal gateway -> SQLAlchemy fallback)
+        scenario_out = await scenario_data_gateway.create_scenario_for_user(
+            db=db,
             user_id=current_user.id,
             user_name=request.user_name,
             character_name=request.character_name,
             situation=request.situation,
             summary=summary_text,
-            background=background_text
+            background=background_text,
         )
-        db.add(new_scenario)
-        await db.commit()
-        await db.refresh(new_scenario)
 
         return {
             "success": True,
             "data": {
-                "scenario_id": new_scenario.id, # ID 반환 추가
-                "summary": summary_text,
-                "background": background_text
+                "scenario_id": scenario_out["scenario_id"], # ID 반환 추가
+                "summary": scenario_out["summary"],
+                "background": scenario_out["background"],
             }
         }
 

@@ -12,7 +12,7 @@ from app.models.user import User
 from app.models.character import Character
 from app.core.llm import call_llm, call_llm_stream
 from app.services.context_manager import context_manager
-from app.services import chat_service, character_service
+from app.services import chat_service, character_service, history_service
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -227,7 +227,7 @@ async def _run_chat_turn_llm_and_persist(
     chat_messages: List[Dict[str, str]],
     system_instruction: Optional[str],
     speaker_name: str,
-) -> tuple[str, Dict[str, Any]]:
+) -> tuple[str, Dict[str, Any], Dict[str, Optional[str]]]:
     """
     [역할]
     `/chat`의 LLM 호출 -> 응답 후처리 -> DB 저장/commit 흐름을 한 번에 수행한다.
@@ -254,14 +254,14 @@ async def _run_chat_turn_llm_and_persist(
         system_instruction=system_instruction,
     )
     content = chat_service.sanitize_assistant_reply_content(result["content"], speaker_name)
-    await chat_service.persist_chat_turn_messages(
+    persisted = await chat_service.persist_chat_turn_messages(
         db=db,
         session_id=session_id,
         raw_request_messages=request.messages,
         assistant_content=content,
         speaker_name=speaker_name,
     )
-    return content, result["usage"]
+    return content, result["usage"], persisted
 
 
 async def _maybe_attach_tts_audio_url(
@@ -271,7 +271,7 @@ async def _maybe_attach_tts_audio_url(
     request: ChatRequest,
     current_user: Optional[User],
     db: AsyncSession,
-) -> None:
+) -> Optional[Dict[str, Any]]:
     """
     [역할]
     `/chat` 응답에 TTS `audio_url`을 조건부로 추가한다.
@@ -292,7 +292,7 @@ async def _maybe_attach_tts_audio_url(
     - `response_data["audio_url"]` 추가는 성공 시에만 수행한다. 키를 억지로 넣으면 프론트 분기 로직이 흔들릴 수 있다.
     """
     if not request.tts_enabled or not (content or "").strip():
-        return
+        return None
 
     voice_id = await character_service.resolve_character_voice_id_for_tts(
         character_id=request.character_id,
@@ -301,7 +301,7 @@ async def _maybe_attach_tts_audio_url(
         default_voice_id="default",
     )
     try:
-        audio_url = await chat_service.synthesize_chat_tts_audio_url(
+        tts_result = await chat_service.synthesize_chat_tts_result(
             text=content,
             voice_id=voice_id,
             streaming_mode=request.tts_streaming_mode,
@@ -309,10 +309,12 @@ async def _maybe_attach_tts_audio_url(
             current_user=current_user,
             db=db,
         )
-        if audio_url:
-            response_data["audio_url"] = audio_url
+        if tts_result and tts_result.get("audio_url"):
+            response_data["audio_url"] = tts_result["audio_url"]
+            return tts_result
     except Exception as e:
         logger.warning("TTS 합성 실패(audio_url 미포함): %s", e)
+    return None
 
 
 async def _generate_chat_stream_sse_events(
@@ -533,6 +535,20 @@ async def chat(
     session_id = request.session_id or str(uuid.uuid4())
     if principal and principal.kind == "guest" and principal.guest_session:
         logger.info("Guest chat request session_id=%s guest_session_id=%s", session_id, principal.guest_session.id)
+    try:
+        # history root 선점: 동일 session_id 재사용으로 타인 기록에 append하는 시도를 초기에 차단한다.
+        await history_service.ensure_conversation_for_session(
+            db=db,
+            session_id=session_id,
+            principal=principal,
+            request=request,
+            create_if_missing=False,
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except Exception as e:
+        logger.warning("History ownership precheck skipped (non-fatal): %s", e)
+
     prepared = await _prepare_chat_request_for_llm(
         request=request,
         db=db,
@@ -555,7 +571,7 @@ async def chat(
             is_director_mode=is_director_mode,
             current_speaker=current_speaker,
         )
-        content, usage = await _run_chat_turn_llm_and_persist(
+        content, usage, persisted_meta = await _run_chat_turn_llm_and_persist(
             db=db,
             session_id=session_id,
             request=request,
@@ -564,6 +580,21 @@ async def chat(
             speaker_name=speaker_name,
         )
 
+        conversation = None
+        try:
+            conversation = await history_service.update_conversation_after_chat_turn(
+                db=db,
+                session_id=session_id,
+                principal=principal,
+                request=request,
+                assistant_content=content,
+                speaker_name=speaker_name,
+            )
+        except PermissionError as e:
+            logger.warning("History conversation update denied (non-fatal): %s", e)
+        except Exception as e:
+            logger.warning("History conversation update failed (non-fatal): %s", e)
+
         response_data = {
             "content": content,
             "usage": usage,
@@ -571,13 +602,25 @@ async def chat(
             "context_summarized": did_summarize
         }
 
-        await _maybe_attach_tts_audio_url(
+        tts_result = await _maybe_attach_tts_audio_url(
             response_data=response_data,
             content=content,
             request=request,
             current_user=current_user,
             db=db,
         )
+        if conversation and tts_result:
+            try:
+                await history_service.attach_conversation_audio_asset_from_chat_tts(
+                    db=db,
+                    principal=principal,
+                    conversation_id=conversation.id,
+                    message_id=persisted_meta.get("assistant_message_id"),
+                    tts_data=tts_result,
+                    fallback_voice_id=tts_result.get("voice_id"),
+                )
+            except Exception as e:
+                logger.warning("History audio asset attach failed (non-fatal): %s", e)
 
         return {
             "success": True,

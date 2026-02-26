@@ -30,6 +30,27 @@ class Settings(BaseSettings):
     # Database
     # Default to sqlite for dev if postgres not provided
     DATABASE_URL: str = "sqlite+aiosqlite:///./avatar_forge.db" 
+    # 데이터 계층 분리 전환 토글 (C gRPC data-service 사용)
+    USE_C_DATA_SERVICE: bool = False
+    DATA_SERVICE_GRPC_ADDR: str = "localhost:50051"
+    DATA_SERVICE_TIMEOUT_MS: int = 5000
+    # gRPC 툴체인이 없는 환경에서 c-data-service 바이너리 one-shot 명령으로
+    # rehearsal 경로를 확인하기 위한 임시 브리지 (Phase C 중간 단계).
+    DATA_SERVICE_CLI_BRIDGE_ENABLED: bool = False
+    DATA_SERVICE_CLI_BIN: str = "c-data-service"
+    # 리허설 단계에서는 gRPC 실패 시 Python 브리지 fallback을 허용한다.
+    # 컷오버 리허설 후반/운영 검증에서는 false로 내려 fallback 없이 실패하게 만들어
+    # 실제 gRPC 경유 성공 여부를 강제 검증할 수 있다.
+    DATA_SERVICE_REHEARSAL_FALLBACK_ENABLED: bool = True
+
+    # 하이브리드 저장 정책 (향후 C data-service/스토리지 계층에서 사용)
+    MEDIA_STORAGE_ROOT: str = "/mnt/media_assets"
+    MODEL_STORAGE_ROOT: str = "/mnt/models"
+    BLOB_MAX_BYTES_DEFAULT: int = 16 * 1024 * 1024
+    BLOB_MAX_BYTES_AUDIO: int = 64 * 1024 * 1024
+    # Phase E 컷오버 준비: backend가 파일 기반 preset fallback을 사용할지 제어
+    # (운영/리허설 후반에는 False로 내려 DB preset source 단일화를 강제)
+    CHARACTER_FILE_PRESET_FALLBACK_ENABLED: bool = True
 
     # JWT
     SECRET_KEY: str = "YOUR_SECRET_KEY_HERE_CHANGE_IN_PROD"
@@ -90,6 +111,9 @@ class Settings(BaseSettings):
     GUEST_AUTH_COOKIE_NAME: str = "guest_access_token"
     GUEST_ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 1 day
     GUEST_COOKIE_SESSION_ONLY: bool = True
+    # Google 로그인 후 guest→Google 병합 모달을 띄우기 위해 guest 쿠키를 잠시 유지한다.
+    # 최종 정리는 /api/auth/guest/merge 또는 /api/auth/logout에서 수행.
+    PRESERVE_GUEST_COOKIE_ON_GOOGLE_LOGIN: bool = True
 
     # LLM 서비스 설정
     # "vllm" 또는 "ollama" 중 선택 (동시 실행 불가, VRAM 제약)
@@ -217,6 +241,14 @@ class Settings(BaseSettings):
     @property
     def redis_url_value(self) -> str:
         return (self.REDIS_URL or "redis://localhost:6379/0").strip()
+
+    @property
+    def data_service_grpc_addr_value(self) -> str:
+        return (self.DATA_SERVICE_GRPC_ADDR or "localhost:50051").strip()
+
+    @property
+    def data_service_cli_bin_value(self) -> str:
+        return (self.DATA_SERVICE_CLI_BIN or "c-data-service").strip() or "c-data-service"
 
     model_config = SettingsConfigDict(
         env_file=".env", 

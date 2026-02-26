@@ -16,8 +16,16 @@ from app.core.database import get_db
 from app.core.security import create_access_token, create_guest_access_token
 from app.models.user import User
 from app.models.guest_session import GuestSession
-from app.api.deps import get_current_principal_optional, AuthPrincipal
+from app.api.deps import (
+    get_current_principal_optional,
+    AuthPrincipal,
+    get_current_user,
+    get_guest_token_from_request,
+    _get_guest_session_from_token,
+)
 from app.services.auth_audit_service import log_auth_event
+from app.services import history_data_gateway
+from app.services import auth_principal_data_gateway
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -35,6 +43,11 @@ sso = GoogleSSO(
 
 class GuestLoginRequest(BaseModel):
     display_name: Optional[str] = Field(default=None, max_length=50)
+
+
+class GuestMergeRequest(BaseModel):
+    mode: str = Field(pattern="^(merge|discard)$")
+    guest_session_id: Optional[str] = Field(default=None, max_length=64)
 
 
 def _sanitize_guest_display_name(raw_name: Optional[str]) -> str:
@@ -259,13 +272,15 @@ def _build_auth_callback_redirect_response(*, access_token: str) -> RedirectResp
         max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         path="/"
     )
-    # Google 로그인 성공 시 남아있을 수 있는 guest 쿠키는 제거해 세션 혼선을 방지한다.
-    response.delete_cookie(
-        key=settings.guest_auth_cookie_name,
-        path="/",
-        samesite=settings.auth_cookie_samesite_value,
-        secure=settings.AUTH_COOKIE_SECURE,
-    )
+    # guest→Google 병합 UX를 위해 guest 쿠키를 보존할 수 있다.
+    # 최종 정리는 /auth/guest/merge(discard/merge) 또는 /auth/logout 에서 처리한다.
+    if not settings.PRESERVE_GUEST_COOKIE_ON_GOOGLE_LOGIN:
+        response.delete_cookie(
+            key=settings.guest_auth_cookie_name,
+            path="/",
+            samesite=settings.auth_cookie_samesite_value,
+            secure=settings.AUTH_COOKIE_SECURE,
+        )
     return response
 
 @router.get("/google/login")
@@ -301,21 +316,19 @@ async def guest_login(
 
     display_name = _sanitize_guest_display_name(body.display_name)
     now = datetime.utcnow()
-    guest_session = GuestSession(
-        id=str(uuid.uuid4()),
-        display_name=display_name,
-        status="active",
-        last_seen_at=now,
-        expires_at=now + timedelta(minutes=settings.GUEST_ACCESS_TOKEN_EXPIRE_MINUTES),
-        client_ip=request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else None),
-        user_agent=request.headers.get("user-agent"),
-    )
-    db.add(guest_session)
+    guest_session_id = str(uuid.uuid4())
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else None)
+    user_agent = request.headers.get("user-agent")
     try:
-        await db.commit()
-        await db.refresh(guest_session)
+        guest_session = await auth_principal_data_gateway.create_guest_session(
+            db=db,
+            guest_session_id=guest_session_id,
+            display_name=display_name,
+            expires_at=now + timedelta(minutes=settings.GUEST_ACCESS_TOKEN_EXPIRE_MINUTES),
+            client_ip=client_ip,
+            user_agent=user_agent,
+        )
     except Exception:
-        await db.rollback()
         logger.exception("Failed to create guest session")
         await log_auth_event(
             db,
@@ -409,14 +422,178 @@ async def get_current_user_info(
         )
 
     if principal.kind == "guest" and principal.guest_session:
-        principal.guest_session.last_seen_at = datetime.utcnow()
         try:
-            await db.commit()
+            updated_guest = await auth_principal_data_gateway.touch_guest_session(
+                db=db,
+                guest_session_id=principal.guest_session.id,
+            )
+            if updated_guest:
+                principal.guest_session = updated_guest
         except Exception:
-            await db.rollback()
             logger.exception("Failed to update guest_session.last_seen_at guest_session_id=%s", principal.guest_session.id)
 
     return _build_auth_principal_response(principal)
+
+
+@router.get("/guest/merge-preview")
+async def guest_merge_preview(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Google 로그인 이후 남아있는 guest 쿠키/세션 병합 여부를 결정하기 위한 미리보기.
+
+    현재 단계에서는 Python 브리지 history_service 기준 카운트/용량 미리보기를 제공하고,
+    `USE_C_DATA_SERVICE=true` 실리허설에서는 내부적으로 data-service 경유 경로를 먼저 시도한 뒤
+    미구현/실패 시 Python 경로로 fallback한다.
+    """
+    guest_token = await get_guest_token_from_request(request)
+    guest_session = await _get_guest_session_from_token(token=guest_token, db=db, mark_expired=True)
+    has_guest = guest_session is not None
+    counts = {"conversation_count": 0, "audio_count": 0, "storage_bytes": 0}
+    if guest_session:
+        try:
+            counts = await history_data_gateway.guest_merge_preview_counts(db=db, guest_session_id=guest_session.id)
+        except Exception:
+            logger.exception("Failed to build guest merge preview counts guest_session_id=%s", guest_session.id)
+    return {
+        "success": True,
+        "data": {
+            "available": has_guest,
+            "supported": True,
+            "guest_session_id": guest_session.id if guest_session else None,
+            "guest_display_name": guest_session.display_name if guest_session else None,
+            "conversation_count": counts["conversation_count"] if guest_session else 0,
+            "audio_count": counts["audio_count"] if guest_session else 0,
+            "storage_bytes": counts["storage_bytes"] if guest_session else 0,
+            "message": (
+                "Guest session detected. Merge preview is available."
+                if has_guest
+                else "No active guest session found."
+            ),
+            "user_id": current_user.id,
+        },
+    }
+
+
+@router.post("/guest/merge")
+async def guest_merge(
+    body: GuestMergeRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    guest→Google 병합/폐기 1차 구현.
+
+    - mode=discard: guest 세션을 종료 처리하고 guest 쿠키만 제거 (Google 로그인 유지)
+    - mode=merge: guest ownership을 Google user ownership으로 이동(move-only)
+      (`USE_C_DATA_SERVICE=true` 실리허설에서는 내부 data-service 경유를 먼저 시도하고 fallback 가능)
+    """
+    guest_token = await get_guest_token_from_request(request)
+    guest_session = await _get_guest_session_from_token(token=guest_token, db=db, mark_expired=True)
+    if not guest_session:
+        raise HTTPException(status_code=404, detail="활성 guest 세션을 찾을 수 없습니다.")
+
+    if body.guest_session_id and body.guest_session_id != guest_session.id:
+        raise HTTPException(status_code=400, detail="guest_session_id가 현재 guest 쿠키와 일치하지 않습니다.")
+
+    if body.mode == "discard":
+        try:
+            updated_guest = await auth_principal_data_gateway.update_guest_session_status(
+                db=db,
+                guest_session_id=guest_session.id,
+                status_value="logged_out",
+                reason="guest_merge_discard",
+            )
+            if updated_guest:
+                guest_session = updated_guest
+        except Exception:
+            logger.exception("Failed to discard guest session guest_session_id=%s", guest_session.id)
+            raise HTTPException(status_code=500, detail="guest 세션 종료 처리에 실패했습니다.")
+
+        await log_auth_event(
+            db,
+            request=request,
+            actor_type="guest",
+            actor_id=guest_session.id,
+            provider="guest",
+            event_type="guest_merge_discard",
+            success=True,
+            commit=True,
+        )
+        response = JSONResponse(
+            content={
+                "success": True,
+                "data": {
+                    "mode": "discard",
+                    "guest_session_id": guest_session.id,
+                    "merged": False,
+                    "discarded": True,
+                    "user_id": current_user.id,
+                },
+            }
+        )
+        response.delete_cookie(
+            key=settings.guest_auth_cookie_name,
+            path="/",
+            samesite=settings.auth_cookie_samesite_value,
+            secure=settings.AUTH_COOKIE_SECURE,
+        )
+        return response
+
+    # mode=merge (1차 정책: move-only ownership transfer)
+    moved_counts = await history_data_gateway.move_guest_history_to_user(
+        db=db,
+        guest_session_id=guest_session.id,
+        user_id=current_user.id,
+    )
+    try:
+        updated_guest = await auth_principal_data_gateway.update_guest_session_status(
+            db=db,
+            guest_session_id=guest_session.id,
+            status_value="merged",
+            reason="guest_merge_commit",
+        )
+        if updated_guest:
+            guest_session = updated_guest
+    except Exception:
+        logger.exception("Failed to finalize guest merge guest_session_id=%s user_id=%s", guest_session.id, current_user.id)
+        raise HTTPException(status_code=500, detail="guest 기록 병합 후 세션 상태 저장에 실패했습니다.")
+
+    await log_auth_event(
+        db,
+        request=request,
+        actor_type="guest",
+        actor_id=guest_session.id,
+        provider="guest",
+        event_type="guest_merge_commit",
+        success=True,
+        reason=f"moved_conversations={moved_counts['conversation_count']},moved_audio={moved_counts['audio_count']}",
+        commit=True,
+    )
+    response = JSONResponse(
+        content={
+            "success": True,
+            "data": {
+                "mode": "merge",
+                "guest_session_id": guest_session.id,
+                "merged": True,
+                "discarded": False,
+                "user_id": current_user.id,
+                "conversation_count": moved_counts["conversation_count"],
+                "audio_count": moved_counts["audio_count"],
+            },
+        }
+    )
+    response.delete_cookie(
+        key=settings.guest_auth_cookie_name,
+        path="/",
+        samesite=settings.auth_cookie_samesite_value,
+        secure=settings.AUTH_COOKIE_SECURE,
+    )
+    return response
 
 @router.post("/logout")
 async def logout(
@@ -434,13 +611,14 @@ async def logout(
     redirect_url = f"{frontend_url}/"
     
     if principal and principal.kind == "guest" and principal.guest_session:
-        principal.guest_session.status = "logged_out"
-        principal.guest_session.ended_at = datetime.utcnow()
-        principal.guest_session.last_seen_at = datetime.utcnow()
         try:
-            await db.commit()
+            await auth_principal_data_gateway.update_guest_session_status(
+                db=db,
+                guest_session_id=principal.guest_session.id,
+                status_value="logged_out",
+                reason="logout",
+            )
         except Exception:
-            await db.rollback()
             logger.exception("Failed to mark guest logout guest_session_id=%s", principal.guest_session.id)
         await log_auth_event(
             db,

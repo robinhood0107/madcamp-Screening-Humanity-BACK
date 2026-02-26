@@ -15,6 +15,7 @@ from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth_event import AuthEvent
+from app.services.data_service_client import data_service_client
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,34 @@ async def log_auth_event(
     reason: Optional[str] = None,
     commit: bool = False,
 ) -> None:
+    client_ip = _extract_client_ip(request)
+    user_agent = (request.headers.get("user-agent") if request else None)
+
+    if data_service_client.is_enabled():
+        try:
+            data_service_client.auth_event_create(
+                payload={
+                    "actor_type": actor_type,
+                    "actor_id": actor_id,
+                    "provider": provider,
+                    "event_type": event_type,
+                    "success": success,
+                    "reason": reason,
+                    "client_ip": client_ip,
+                    "user_agent": user_agent,
+                }
+            )
+            return
+        except Exception:
+            logger.warning(
+                "Auth audit data-service path failed; falling back to SQLAlchemy actor_type=%s actor_id=%s provider=%s event_type=%s",
+                actor_type,
+                actor_id,
+                provider,
+                event_type,
+                exc_info=True,
+            )
+
     try:
         db.add(
             AuthEvent(
@@ -51,8 +80,8 @@ async def log_auth_event(
                 event_type=event_type,
                 success=success,
                 reason=reason,
-                client_ip=_extract_client_ip(request),
-                user_agent=(request.headers.get("user-agent") if request else None),
+                client_ip=client_ip,
+                user_agent=user_agent,
             )
         )
         if commit:

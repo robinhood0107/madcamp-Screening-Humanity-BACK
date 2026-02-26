@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from app.core.database import get_db
 from app.core.config import settings
+from app.services.data_service_client import data_service_client
 import httpx
 import time
 import asyncio
@@ -105,6 +106,19 @@ async def check_system_health(db: AsyncSession = Depends(get_db)):
             "message": str(e),
             "url": "Internal"
         }
+
+    # 1.5 C Data Service (gRPC rehearsal 포함)
+    ds = data_service_client.health_check()
+    ds_status = ds.get("status") or "unknown"
+    results["data_service"] = {
+        "name": "C Data Service (gRPC)",
+        "status": "online" if ds_status == "grpc_ok" else ("degraded" if ds_status in {"scaffold_only", "grpc_unavailable"} else "offline"),
+        "latency": 0,
+        "message": ds.get("detail") or ds_status,
+        "url": ds.get("grpc_addr") or settings.data_service_grpc_addr_value,
+        "mode": "enabled" if ds.get("enabled") else "disabled",
+        "grpc_status": ds_status,
+    }
 
     # 2. External Services to check
     # (key, url, display_name, timeout초)

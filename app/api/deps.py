@@ -14,6 +14,7 @@ from app.core.config import settings
 from app.core.security import GUEST_SUBJECT_PREFIX
 from app.models.user import User
 from app.models.guest_session import GuestSession
+from app.services import auth_principal_data_gateway
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/auth/login/access-token", auto_error=False)
 logger = logging.getLogger(__name__)
@@ -79,8 +80,7 @@ async def _get_user_from_token(*, token: Optional[str], db: AsyncSession) -> Opt
     subject_kind, subject_id = _parse_subject(subject)
     if subject_kind != "user" or not subject_id:
         return None
-    result = await db.execute(select(User).where(User.id == subject_id))
-    return result.scalar_one_or_none()
+    return await auth_principal_data_gateway.get_user_by_id(db=db, user_id=subject_id)
 
 
 async def _get_guest_session_from_token(
@@ -96,8 +96,9 @@ async def _get_guest_session_from_token(
     if subject_kind != "guest" or not subject_id:
         return None
 
-    result = await db.execute(select(GuestSession).where(GuestSession.id == subject_id))
-    guest_session = result.scalar_one_or_none()
+    guest_session = await auth_principal_data_gateway.get_guest_session_by_id(
+        db=db, guest_session_id=subject_id
+    )
     if not guest_session:
         return None
 
@@ -107,12 +108,16 @@ async def _get_guest_session_from_token(
     expires_at = guest_session.expires_at
     if expires_at and expires_at.replace(tzinfo=None) <= datetime.utcnow():
         if mark_expired:
-            guest_session.status = "expired"
-            guest_session.ended_at = datetime.utcnow()
             try:
-                await db.commit()
+                updated = await auth_principal_data_gateway.update_guest_session_status(
+                    db=db,
+                    guest_session_id=guest_session.id,
+                    status_value="expired",
+                    reason="expires_at_reached",
+                )
+                if updated is not None:
+                    guest_session = updated
             except Exception:
-                await db.rollback()
                 logger.exception("Failed to mark guest session expired guest_session_id=%s", guest_session.id)
         return None
 
@@ -159,8 +164,7 @@ async def get_current_user(
         subject = _decode_subject_from_token(user_token)
         subject_kind, subject_id = _parse_subject(subject)
         if subject_kind == "user" and subject_id:
-            result = await db.execute(select(User).where(User.id == subject_id))
-            user = result.scalar_one_or_none()
+            user = await auth_principal_data_gateway.get_user_by_id(db=db, user_id=subject_id)
             if user:
                 return user
         elif subject_kind == "guest":
@@ -222,8 +226,7 @@ async def get_current_user_optional(
     if subject_kind != "user" or not user_id:
         return None
 
-    result = await db.execute(select(User).where(User.id == user_id))
-    return result.scalar_one_or_none()
+    return await auth_principal_data_gateway.get_user_by_id(db=db, user_id=user_id)
 
 
 async def require_admin(
@@ -252,4 +255,3 @@ async def require_admin(
             detail="관리자 권한이 필요합니다",
         )
     return current_user
-

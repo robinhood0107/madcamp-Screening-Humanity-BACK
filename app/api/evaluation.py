@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_db
 from app.core.llm import call_llm
 from app.services.context_manager import context_manager
+from app.services import evaluation_data_gateway
 import json
 import logging
 
@@ -103,6 +104,31 @@ async def evaluate_chat(
         
         data["summary"] = final_summary
         
+        response_payload = {
+            "score": data.get("score"),
+            "feedback": data.get("feedback") or "",
+            "summary": final_summary,
+        }
+
+        # 5) 평가 결과 영속화 (data-service rehearsal gateway -> SQLAlchemy/text fallback)
+        try:
+            persist_result = await evaluation_data_gateway.create_evaluation_for_legacy_session(
+                db=db,
+                legacy_session_id=str(request.session_id or "default_session"),
+                score=response_payload["score"] if isinstance(response_payload["score"], int) else None,
+                summary=str(response_payload["summary"] or ""),
+                feedback=str(response_payload["feedback"] or ""),
+                raw_payload=data if isinstance(data, dict) else None,
+            )
+            if not persist_result.get("created"):
+                logger.info(
+                    "Evaluation persistence skipped/failed session_id=%s reason=%s",
+                    request.session_id,
+                    persist_result.get("reason"),
+                )
+        except Exception:
+            logger.exception("Evaluation persistence gateway failed session_id=%s", request.session_id)
+
         return {
             "success": True,
             "data": data
@@ -112,11 +138,29 @@ async def evaluate_chat(
         # broad except 유지 이유:
         # LLM 호출/JSON 파싱/요약 저장 중 어디서 실패하든 현재 UX 계약은 "fallback 평가 결과 반환"이기 때문이다.
         logger.warning("Evaluation fallback used: %s", e)
+        fallback_data = {
+            "score": 50,
+            "feedback": "대화 데이터를 분석할 수 없었어요...",
+            "summary": "알 수 없는 이유로 대화가 중단되었습니다."
+        }
+
+        # fallback 평가도 best-effort로 저장 시도 (기록 상세에서 평가 탭 재사용 대비)
+        try:
+            await evaluation_data_gateway.create_evaluation_for_legacy_session(
+                db=db,
+                legacy_session_id=str(request.session_id or "default_session"),
+                score=int(fallback_data["score"]),
+                summary=str(fallback_data["summary"]),
+                feedback=str(fallback_data["feedback"]),
+                raw_payload={
+                    "fallback": True,
+                    "reason": str(e),
+                },
+            )
+        except Exception:
+            logger.exception("Fallback evaluation persistence failed session_id=%s", request.session_id)
+
         return {
             "success": True,
-            "data": {
-                "score": 50,
-                "feedback": "대화 데이터를 분석할 수 없었어요...",
-                "summary": "알 수 없는 이유로 대화가 중단되었습니다."
-            }
+            "data": fallback_data
         }

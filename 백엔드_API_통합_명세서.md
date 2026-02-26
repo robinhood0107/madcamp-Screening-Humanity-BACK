@@ -13,6 +13,70 @@
   - 라우터별 응답 형식 차이(래퍼형/직반환형/리다이렉트/SSE)를 명확히 구분
   - 리팩토링 이후에도 유지해야 하는 외부 계약을 한 문서에서 확인 가능하게 함
 
+## 최근 작업 메모 (2026-02-26)
+
+- `history` API 1차 구현 반영:
+  - `GET /api/history`, `GET /api/history/{conversation_id}`, `DELETE /api/history/{conversation_id}` 실동작 (Python 브리지 테이블 기반)
+  - `POST /api/history/{conversation_id}/audio/download`, `/audio/download-all` 실동작 (개별/zip 다운로드)
+  - `POST /api/history/{conversation_id}/tts/regenerate` 실동작 (기존 chat TTS wrapper 재사용 + history 오디오 자산 링크 저장)
+- guest→Google 병합 API 1차 구현 반영:
+  - `GET /api/auth/guest/merge-preview` 카운트/용량 preview 제공
+  - `POST /api/auth/guest/merge` `merge(move-only)` + `discard` 지원
+- Google 로그인 후 병합 UX 준비를 위한 guest 쿠키 보존 플래그 유지 (`PRESERVE_GUEST_COOKIE_ON_GOOGLE_LOGIN`)
+- 프론트 `landing`의 "내 기록" 패널은 서버 `/api/history` 목록/상세를 우선 사용하도록 전환되었고,
+  - Google 계정은 서버 목록이 비어있을 때도 서버 원본 상태를 우선 표시한다. (레거시 로컬 fallback 기본 미사용)
+  - guest 계정은 서버 오류 시 현재 탭의 로컬 임시 기록 fallback을 유지한다.
+- 프론트 `landing`에 guest→Google 병합 모달 1차 UX가 연결되었다. (`merge` / `discard` / `나중에 결정(보류)`)
+- guest→Google 병합 모달 로직은 프론트 공통 hook/dialog로 정리되었고, `/history` 페이지에서도 동일 정책으로 표시된다.
+- 프론트 `chat-room`의 로컬 `chatHistories` 저장 경로는 `saveChatHistoryCompat()`로 정리되었고,
+  - Google 계정은 서버 history를 원본으로 두며 브라우저 메모리에는 현재 세션 임시 캐시만 유지한다.
+  - guest/anonymous는 호환성 때문에 기존 로컬 저장 경로를 당분간 유지한다.
+- `USE_C_DATA_SERVICE=true` 실리허설 경로를 위해 `history/guest merge` 일부 API는 backend 내부에서
+  `history_data_gateway -> data_service_client(최소 gRPC 시도) -> Python history_service fallback` 순서로 경유하도록 정리되었다.
+  (외부 HTTP 계약 변화 없음)
+- 리허설 단계에서 `grpcurl` 미가용 환경을 보조하기 위해 `DataServiceClient`는 `c-data-service` one-shot JSON CLI bridge도 사용하며,
+  현재 최소 범위로 `history list/detail/delete`, `guest merge preview/move`, `characters/presets`, `users/me/settings` 호출을 C data-service 경유 시도할 수 있다.
+- 같은 CLI bridge 범위가 guest session 조회/상태변경과 `auth_events` 생성까지 확장되기 시작했고,
+  인증 감사 로그 helper(`auth_audit_service`)는 data-service 우선 / SQLAlchemy fallback(best-effort) 구조를 사용한다.
+- 같은 리허설 패턴이 `auth/deps`의 토큰 기반 user lookup과 `story.py`의 `Scenario` 저장에도 확장되기 시작했다.
+  (`auth_principal_data_gateway`, `scenario_data_gateway`; 외부 HTTP 계약 변화 없음)
+- 같은 리허설 패턴이 `evaluation.py`의 평가 결과 영속화에도 확장되기 시작했다.
+  (`evaluation_data_gateway`; data-service 우선 / SQLAlchemy-text fallback, 외부 HTTP 계약 변화 없음)
+- `/api/system/health/detailed` 응답에는 `data_service` 상태가 추가되어 C data-service gRPC 리허설 상태
+  (`grpc_ok` / `scaffold_only` / `grpc_unavailable`)를 함께 관찰할 수 있다.
+- `USE_C_DATA_SERVICE=true` 리허설 경로에는 `DATA_SERVICE_REHEARSAL_FALLBACK_ENABLED`가 추가되어,
+  최소 gRPC 호출 실패 시 Python fallback 허용/차단 정책을 환경값으로 제어할 수 있다.
+- `c-data-service` 컨테이너는 `--healthcheck` one-shot 모드(내부 PostgreSQL 연결 점검)를 지원하며 compose healthcheck에 연결되었다.
+- `c-data-service`는 `--check-schema` one-shot 모드도 지원하여 리허설 전에 핵심 테이블/뷰 존재 여부를 점검할 수 있다.
+- `scripts/smoke_data_service_rehearsal.py`로 `grpcurl`/`docker`/`protoc` 등 Phase C 도구체인 준비 상태와 `HealthService.Check` best-effort 스모크를 JSON으로 확인할 수 있다.
+- `DataServiceClient`는 리허설 단계에서 `DATA_SERVICE_CLI_BRIDGE_ENABLED=true`일 경우 `c-data-service` one-shot JSON 명령을 통해
+  최소 `history/guest merge` 호출을 C data-service 경유로 시도할 수 있다. (gRPC toolchain 부재 환경 보조 경로)
+- 같은 CLI bridge 범위가 확장되어 `evaluation` 결과 영속화(`CreateEvaluationByLegacySession` / `--json-evaluation-create-by-session`)도
+  C data-service 경유 시도를 먼저 수행할 수 있다. (리허설 단계, 실패 시 fallback 유지)
+- `GET /api/characters/presets`, `GET/PUT /api/users/me/settings`도 내부적으로
+  `data_service_client -> *_data_gateway -> 기존 SQLAlchemy fallback` 구조(리허설 단계)로 전환되기 시작했다. (외부 HTTP 계약 변화 없음)
+- PostgreSQL canonical schema와 Python 브리지 ORM의 컬럼/제약 차이를 줄이기 위해 `004/005` 브리지 호환 migration이 추가되어,
+  `conversations`/`conversation_audio_assets` 및 history 관련 view(`v_history_*`)에 레거시 alias/보조 컬럼이 보강되었다.
+- 프론트 `/history` 상세 화면은 1차 재연결로 숨겨진 백엔드 기능(`POST /api/evaluation/evaluate`, `POST /api/ai/story/analyze`)과
+  `POST /api/history/{conversation_id}/tts/regenerate` 액션을 호출할 수 있게 확장되었다.
+- `GET /api/characters/presets`는 Phase E 브리지로 DB `character_catalog`(public+preset)를 우선 조회하며,
+  DB가 비어있거나 브리지 실패 시 기존 `FRONT/public/characters` 파일 로더로 fallback 한다.
+- 관리자 캐릭터 카탈로그 1차 API가 추가되었다:
+  - `GET /api/admin/character-catalog`
+  - `POST /api/admin/character-catalog/seed-import`
+  - `PUT /api/admin/character-catalog/{id}`
+  - `DELETE /api/admin/character-catalog/{id}`
+- 관리자 캐릭터 카탈로그 API 1차 확장:
+  - `POST /api/admin/character-catalog/{id}/persona/generate` 실구현 (AI 생성 + DB 저장, 실패 시 mock fallback)
+  - `POST /api/admin/character-catalog/{id}/image` 실구현 확장 (링크 지정 + 파일 업로드(media_assets 하이브리드 저장))
+  - `GET /api/admin/character-catalog/{id}/revisions` 추가 (관리자 변경 이력 조회)
+  - `GET /api/characters/catalog-image/{catalog_id}` 추가 (DB `media_assets` blob/volume 기반 이미지 서빙, 필요 시 external link redirect fallback)
+- 관리자 캐릭터 카탈로그 `seed-import` 응답에는 `image_stats`가 포함되어 이미지 seed import 후보/누락/오류 및 BLOB/volume 저장 분포를 확인할 수 있다.
+- 프론트 preset 로딩 경로는 backend `/api/characters/presets`를 canonical source로 우선 사용하고,
+  로컬 Next route(`/api/characters`)는 개발/비상 fallback 역할로 축소되는 중이다.
+  로컬 fallback은 `NEXT_PUBLIC_LOCAL_PRESET_FALLBACK_ENABLED` / `CHARACTER_LOCAL_PRESET_FALLBACK_ENABLED` 플래그로 단계적으로 차단할 수 있다. (기본값: dev만 허용)
+- 관리자 카탈로그 화면은 캐릭터 이미지 프리뷰(DB catalog-image endpoint)와 revision/history(읽기 전용) 패널까지 연결되어 운영 검수 밀도를 높였다.
+
 ## 목차
 
 1. [문서 사용법 / 범위](#문서-사용법--범위)
@@ -69,9 +133,9 @@
 
 ### 엔드포인트 수 요약
 
-- 라우터 데코레이터 엔드포인트: **54개** (`app/api/*` 기준)
+- 라우터 데코레이터 엔드포인트: **62개** (`app/api/*` 기준)
 - 앱 레벨 직접 엔드포인트: **5개** (`/`, `/api/system/health`, `/api/health`, `/api/system/status`, `/api/test`)
-- 총 공개 HTTP 엔드포인트(현재 코드상): **59개**
+- 총 공개 HTTP 엔드포인트(현재 코드상): **67개**
   - 주의: `@app.get` 2개가 하나의 `health()` 함수에 중복 매핑됨 (`/api/system/health`, `/api/health`)
 
 ### API 스타일(혼합형) 요약
@@ -109,8 +173,10 @@
 
 1. `POST /api/auth/guest/login` -> 서버 `guest_sessions` row 생성 + guest JWT 쿠키(`guest_access_token`) 발급
 2. 프론트는 기존 탭 세션(`sessionStorage`) guest 상태와 함께 사용
-3. `GET /api/auth/me`는 guest 쿠키가 있으면 guest principal 응답 (`auth_mode="guest"`)
-4. `POST /api/auth/logout`는 user/guest 쿠키 모두 제거 시도 + guest logout 이벤트 기록
+3. 프론트 인증 상태 반영은 Google/Guest 모두 `GET /api/auth/me` 단일 부트스트랩으로 통일 가능
+4. 권장 클라이언트 정책(탭 우선): `sessionStorage`가 없으면 guest 쿠키가 남아 있어도 자동 guest 복원하지 않고 `POST /api/auth/logout` 후 익명으로 시작
+5. `GET /api/auth/me`는 guest 쿠키가 있으면 guest principal 응답 (`auth_mode="guest"`)
+6. `POST /api/auth/logout`는 user/guest 쿠키 모두 제거 시도 + guest logout 이벤트 기록
 
 #### 개발 편의 fallback (보안 플래그)
 
@@ -451,6 +517,10 @@
 
 - Auth: 인증 (Google 또는 Guest 쿠키)
 - 역할: 현재 인증 주체(user/guest) 정보 반환 (프론트 초기 부팅 시 자주 호출)
+- 권장 클라이언트 사용 패턴:
+  - Google callback 후 상태 반영
+  - 앱 초기 부팅 시 현재 인증 상태 재동기화
+  - guest 탭세션 존재 여부와 함께 해석해 "탭 우선 guest 복원 정책" 적용
 - 성공 응답 (대표):
 
 ```json
@@ -487,6 +557,7 @@
 - 주의:
   - `is_admin`은 `ADMIN_EMAILS` 설정 기반 계산값
   - user/guest 쿠키가 동시에 있으면 user(Google) 우선 판정
+  - guest 쿠키만 남고 프론트 `sessionStorage` guest payload가 없는 경우, 클라이언트는 UX 정책에 따라 guest 자동복원 대신 `/api/auth/logout` 호출 후 익명 처리할 수 있다 (API 계약 위반 아님)
 
 #### 1-5. `POST /api/auth/logout`
 
@@ -498,6 +569,7 @@
   - guest/user logout `auth_events` 기록
   - guest 로그아웃일 경우 `guest_sessions.status=logged_out`, `ended_at` 갱신
 - 주의: 삭제 옵션(path/samesite/secure)은 설정과 일치해야 브라우저가 정상 삭제
+- 프론트 guest 탭세션(sessionStorage) 삭제는 별도 클라이언트 책임이다. 서버는 guest 쿠키/DB 세션 상태 종료(soft close)만 담당한다.
 
 ### 2. User Settings API (`/api/users/*`)
 

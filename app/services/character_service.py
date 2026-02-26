@@ -54,6 +54,9 @@ def resolve_preset_characters_dir() -> Optional[Path]:
         candidate = Path(env_path)
         return candidate if candidate.is_dir() else None
 
+    if not settings.CHARACTER_FILE_PRESET_FALLBACK_ENABLED:
+        return None
+
     try:
         # services/character_service.py -> app/services -> app -> BACK -> monorepo root
         base = Path(__file__).resolve().parent.parent.parent.parent

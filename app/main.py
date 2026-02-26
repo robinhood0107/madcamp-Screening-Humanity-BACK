@@ -6,6 +6,7 @@ from app.core.config import settings
 from app.core.database import engine, Base
 from app.core.redis import init_redis_pool, close_redis_pool
 from app.api import auth, users, generate
+from app.services.data_service_client import data_service_client
 from contextlib import asynccontextmanager
 import logging
 import os
@@ -77,6 +78,8 @@ def _run_startup_validation_checks() -> None:
         logger.warning("STRICT_STARTUP_VALIDATION: GEMINI_API_KEY 미설정 (Gemini 경로 비활성 가능)")
     if not settings.GOOGLE_CLIENT_ID or not settings.GOOGLE_CLIENT_SECRET:
         logger.warning("STRICT_STARTUP_VALIDATION: Google OAuth 클라이언트 설정 누락 가능")
+    if settings.USE_C_DATA_SERVICE and not settings.DATA_SERVICE_GRPC_ADDR:
+        logger.warning("STRICT_STARTUP_VALIDATION: USE_C_DATA_SERVICE=true 인데 DATA_SERVICE_GRPC_ADDR 비어 있음")
 
 
 def _ensure_runtime_dirs() -> None:
@@ -88,6 +91,19 @@ def _ensure_runtime_dirs() -> None:
     - USER_ASSETS_DIR 디렉터리 생성
     """
     os.makedirs(settings.USER_ASSETS_DIR, exist_ok=True)
+
+
+def _log_data_service_mode() -> None:
+    """
+    [역할]
+    데이터 저장 계층 전환 상태(SQLite/직접 SQLAlchemy vs C data-service 스캐폴드)를 startup 로그에 남긴다.
+
+    [주의]
+    - 현재는 전환 기반만 추가된 단계라 `USE_C_DATA_SERVICE=true`여도 Python 라우터가 전부 gRPC를 사용하지는 않는다.
+    - 오해를 막기 위해 scaffold 상태를 명시적으로 로그에 표시한다.
+    """
+    info = data_service_client.health_check()
+    logger.info("DataService mode: %s", info)
 
 
 async def _apply_startup_schema_patches(conn) -> None:
@@ -147,6 +163,7 @@ async def lifespan(app: FastAPI):
     _log_security_flag_status()
     _run_startup_validation_checks()
     _ensure_runtime_dirs()
+    _log_data_service_mode()
     
     async with engine.begin() as conn:
         # Create tables
@@ -162,6 +179,11 @@ async def lifespan(app: FastAPI):
             user_preference,
             guest_session,
             auth_event,
+            conversation,
+            conversation_audio_asset,
+            media_asset,
+            character_catalog,
+            character_catalog_revision,
         )
         await conn.run_sync(Base.metadata.create_all)
         await _apply_startup_schema_patches(conn)
@@ -220,6 +242,12 @@ app.include_router(system.router, prefix=f"{settings.API_V1_STR}/system", tags=[
 
 from app.api import model_make
 app.include_router(model_make.router, prefix=f"{settings.API_V1_STR}/model-make", tags=["model-make"])
+
+from app.api import history
+app.include_router(history.router, prefix=f"{settings.API_V1_STR}", tags=["history"])
+
+from app.api import character_catalog_admin
+app.include_router(character_catalog_admin.router, prefix=f"{settings.API_V1_STR}", tags=["character-catalog-admin"])
 
 # 레거시 경로 호환성 추가
 app.include_router(ai.router, prefix=f"{settings.API_V1_STR}", tags=["legacy"])

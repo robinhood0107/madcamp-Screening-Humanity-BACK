@@ -3,10 +3,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import logging
 from sqlalchemy.ext.asyncio import AsyncSession
 import tiktoken
-from sqlalchemy import select
 from app.core.config import settings
 from app.core.llm import call_llm
-from app.models.summary import ChatSummary
+from app.services import summary_data_gateway
 # Redis는 선택 사항 (ImportError 방지)
 try:
     import redis
@@ -100,12 +99,7 @@ class ContextManager:
         - `get_summary()`가 우선순위(Redis→DB→Memory)에만 집중하도록 분리한다.
         """
         try:
-            stmt = select(ChatSummary).where(ChatSummary.session_id == session_id)
-            result = await db.execute(stmt)
-            obj = result.scalar_one_or_none()
-            if obj and obj.summary:
-                return obj.summary
-            return None
+            return await summary_data_gateway.get_summary_for_session(db=db, session_id=session_id)
         except Exception as e:
             logger.warning("ContextManager DB load error: %s", e)
             return None
@@ -120,16 +114,7 @@ class ContextManager:
         - 예외 처리 정책(commit/rollback/warning)을 한 곳에 고정한다.
         """
         try:
-            stmt = select(ChatSummary).where(ChatSummary.session_id == session_id)
-            result = await db.execute(stmt)
-            obj = result.scalar_one_or_none()
-
-            if obj:
-                obj.summary = summary
-            else:
-                db.add(ChatSummary(session_id=session_id, summary=summary))
-
-            await db.commit()
+            await summary_data_gateway.put_summary_for_session(db=db, session_id=session_id, summary=summary)
         except Exception as e:
             logger.warning("ContextManager DB save error: %s", e)
             await db.rollback()
